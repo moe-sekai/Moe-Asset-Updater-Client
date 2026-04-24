@@ -1,0 +1,38 @@
+client:
+  # Docker Compose: http://server:8080
+  # Local debug:    http://127.0.0.1:8080
+  server_url: "http://server:8080"
+  bearer_token: "${MOE_ASSET_TOKEN}"
+  user_agent: "MoeInternal/AssetClient"
+  timeout_seconds: 21600
+
+worker:
+  # Leave empty to let server allocate a client id.
+  id: ""
+  name: ""
+  version: ""
+  max_tasks: 1
+  heartbeat_interval_seconds: 30
+  lease_wait_seconds: 30
+  tags:
+    role: "unpacker"
+    region: "any"
+
+workspace:
+  root: "/app/work"
+  cleanup: true
+  keep_failed: true
+
+tools:
+  ffmpeg_path: "/usr/local/bin/ffmpeg"
+  asset_studio_cli_path: "/app/assetstudio/AssetStudioCLI"
+
+concurrency:
+  download: 2
+  acb: 128
+  usm: 128
+  hca: 128
+
+logging:
+  level: "INFO"
+  file: ""
