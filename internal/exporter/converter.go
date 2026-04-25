@@ -70,6 +70,9 @@ func ConvertM2VToMP4(m2vFile string, mp4File string, deleteOriginal bool, ffmpeg
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to convert M2V to MP4: %w\nffmpeg stderr: %s", err, stderr.String())
 	}
+	if err := validateOutputFile(mp4File, "mp4"); err != nil {
+		return err
+	}
 	if deleteOriginal {
 		if err := os.Remove(m2vFile); err != nil {
 			return fmt.Errorf("failed to delete original M2V file: %w", err)
@@ -96,6 +99,9 @@ func ConvertUSMToMP4(usmFile string, mp4File string, ffmpegPath string) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to convert USM to MP4: %w\nffmpeg stderr: %s", err, stderr.String())
 	}
+	if err := validateOutputFile(mp4File, "mp4"); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -106,6 +112,9 @@ func ConvertWavToFLAC(wavFile string, flacFile string, deleteOriginal bool, ffmp
 	cmd.Stderr = nil
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to convert WAV to FLAC: %w", err)
+	}
+	if err := validateOutputFile(flacFile, "flac"); err != nil {
+		return err
 	}
 	if deleteOriginal {
 		if _, err := os.Stat(wavFile); err == nil {
@@ -125,12 +134,28 @@ func ConvertWavToMP3(wavFile string, mp3File string, deleteOriginal bool, ffmpeg
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to convert WAV to MP3: %w\nffmpeg stderr: %s", err, stderr.String())
 	}
+	if err := validateOutputFile(mp3File, "mp3"); err != nil {
+		return err
+	}
 	if deleteOriginal {
 		if _, err := os.Stat(wavFile); err == nil {
 			if err := os.Remove(wavFile); err != nil {
 				return fmt.Errorf("failed to delete original WAV file: %w", err)
 			}
 		}
+	}
+	return nil
+}
+
+// validateOutputFile checks that a converted output file exists and is non-empty.
+func validateOutputFile(path string, format string) error {
+	stat, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("%s output file not found after ffmpeg conversion: %w", format, err)
+	}
+	if stat.Size() == 0 {
+		_ = os.Remove(path)
+		return fmt.Errorf("%s output file is empty after ffmpeg conversion: %s", format, path)
 	}
 	return nil
 }

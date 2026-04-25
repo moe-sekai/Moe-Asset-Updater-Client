@@ -19,21 +19,24 @@ func ExportHCA(hcaFile string, outputDir string, convertToMP3 bool, convertToFLA
 	if err != nil {
 		return fmt.Errorf("failed to create HCA decoder: %w", err)
 	}
-	defer func(decoder *hca.CriWareHCADecoder) {
-		_ = decoder.Close()
-	}(decoder)
 	file, err := os.Create(wavFile)
 	if err != nil {
+		_ = decoder.Close()
 		return fmt.Errorf("failed to create WAV file: %w", err)
 	}
-	defer func(file *os.File) {
+	if err := decoder.DecodeToWav(file); err != nil {
 		_ = file.Close()
-	}(file)
-	err = decoder.DecodeToWav(file)
-	if err != nil {
+		_ = decoder.Close()
 		return fmt.Errorf("failed to decode HCA to WAV: %w", err)
 	}
-	_ = file.Close()
+	if err := file.Close(); err != nil {
+		_ = decoder.Close()
+		return fmt.Errorf("failed to close WAV file: %w", err)
+	}
+	if err := decoder.Close(); err != nil {
+		return fmt.Errorf("failed to close HCA decoder: %w", err)
+	}
+
 	if convertToMP3 {
 		mp3File := filepath.Join(outputDir, baseName+".mp3")
 		if err := ConvertWavToMP3(wavFile, mp3File, deleteOriginalWav, ffmpegPath); err != nil {

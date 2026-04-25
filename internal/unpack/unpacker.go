@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"moe-asset-client/internal/config"
 	"moe-asset-client/internal/exporter"
@@ -110,14 +111,37 @@ func (u *Unpacker) download(ctx context.Context, task protocol.TaskPayload) ([]b
 	for k, v := range task.Headers {
 		client.SetHeader(k, v)
 	}
-	resp, err := client.R().SetContext(ctx).Get(task.DownloadURL)
-	if err != nil {
-		return nil, fmt.Errorf("download %s: %w", task.BundlePath, err)
+
+	const maxRetries = 4
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(1<<(attempt-1)) * time.Second
+			u.logger.Warnf("download %s attempt %d/%d failed: %v, retrying in %s", task.BundlePath, attempt, maxRetries, lastErr, backoff)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		resp, err := client.R().SetContext(ctx).Get(task.DownloadURL)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			lastErr = fmt.Errorf("download %s: %w", task.BundlePath, err)
+			continue
+		}
+		if resp.StatusCode() >= 500 {
+			lastErr = fmt.Errorf("download %s returned %d", task.BundlePath, resp.StatusCode())
+			continue
+		}
+		if resp.StatusCode() < 200 || resp.StatusCode() >= 300 {
+			return nil, fmt.Errorf("download %s returned %d", task.BundlePath, resp.StatusCode())
+		}
+		return resp.Body(), nil
 	}
-	if resp.StatusCode() < 200 || resp.StatusCode() >= 300 {
-		return nil, fmt.Errorf("download %s returned %d", task.BundlePath, resp.StatusCode())
-	}
-	return resp.Body(), nil
+	return nil, lastErr
 }
 
 func (u *Unpacker) ExtractUnityAssetBundle(ctx context.Context, filePath string, exportPath string, outputDir string, category protocol.AssetCategory, options protocol.ExportOptions) error {

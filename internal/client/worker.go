@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -67,6 +68,9 @@ func (w *Worker) Run(ctx context.Context) error {
 
 		tasks, err := w.lease(ctx)
 		if err != nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return ctx.Err()
+			}
 			w.logger.Warnf("lease failed: %v", err)
 			time.Sleep(5 * time.Second)
 			continue
