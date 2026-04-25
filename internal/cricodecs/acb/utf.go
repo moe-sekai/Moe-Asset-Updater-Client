@@ -294,21 +294,35 @@ func (t *UTFTable) resolvePromise(val interface{}) (interface{}, error) {
 	}
 }
 
+func (t *UTFTable) resolveConstants() (map[string]interface{}, error) {
+	resolved := make(map[string]interface{}, len(t.Constants))
+	for k, v := range t.Constants {
+		value, err := t.resolvePromise(v)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve constant [field %s]: %w", k, err)
+		}
+		resolved[k] = value
+	}
+	return resolved, nil
+}
+
 func (t *UTFTable) readRows(buf *Reader) error {
 	rows := make([]map[string]interface{}, t.Header.NumberOfRows)
+	resolvedConstants, err := t.resolveConstants()
+	if err != nil {
+		return err
+	}
 
 	absRowOffset := uint32(t.Header.RowOffset) + 8
 
 	for rowIdx := 0; rowIdx < int(t.Header.NumberOfRows); rowIdx++ {
-		row := make(map[string]interface{})
+		row := make(map[string]interface{}, len(resolvedConstants)+len(t.DynamicKeys))
 
-		// Copy resolved constants into every row
-		for k, v := range t.Constants {
-			resolved, err := t.resolvePromise(v)
-			if err != nil {
-				return fmt.Errorf("failed to resolve constant [row %d, field %s]: %w", rowIdx, k, err)
-			}
-			row[k] = resolved
+		// Copy resolved constants into every row by reference. Large constant byte fields
+		// (for example embedded AWB data) are resolved once and shared instead of being
+		// re-read and re-allocated for every UTF row.
+		for k, v := range resolvedConstants {
+			row[k] = v
 		}
 
 		// Read per-row dynamic fields using pre-parsed schema

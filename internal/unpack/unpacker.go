@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,33 +23,62 @@ import (
 	harukiLogger "moe-asset-client/internal/logger"
 	"moe-asset-client/internal/protocol"
 	"moe-asset-client/internal/utils"
-
-	"github.com/go-resty/resty/v2"
 )
 
 type ProgressFunc func(stage protocol.ProgressStage, progress float64, message string)
 
 type Unpacker struct {
-	cfg    *config.Config
-	logger *harukiLogger.Logger
-	usmSem chan struct{}
-	acbSem chan struct{}
+	cfg         *config.Config
+	logger      *harukiLogger.Logger
+	downloadSem chan struct{}
+	usmSem      chan struct{}
+	acbSem      chan struct{}
+	hcaSem      chan struct{}
 }
 
 func New(cfg *config.Config, logger *harukiLogger.Logger) *Unpacker {
-	usm := cfg.Concurrency.USM
-	if usm <= 0 {
-		usm = 4
-	}
-	acb := cfg.Concurrency.ACB
-	if acb <= 0 {
-		acb = 16
-	}
+	download := effectiveConcurrency(logger, "download", cfg.Concurrency.Download, 2, 8)
+	usm := effectiveConcurrency(logger, "usm", cfg.Concurrency.USM, 4, 8)
+	acb := effectiveConcurrency(logger, "acb", cfg.Concurrency.ACB, 16, 16)
+	hca := effectiveConcurrency(logger, "hca", cfg.Concurrency.HCA, 16, 16)
 	return &Unpacker{
-		cfg:    cfg,
-		logger: logger,
-		usmSem: make(chan struct{}, usm),
-		acbSem: make(chan struct{}, acb),
+		cfg:         cfg,
+		logger:      logger,
+		downloadSem: make(chan struct{}, download),
+		usmSem:      make(chan struct{}, usm),
+		acbSem:      make(chan struct{}, acb),
+		hcaSem:      make(chan struct{}, hca),
+	}
+}
+
+func effectiveConcurrency(logger *harukiLogger.Logger, name string, value int, defaultValue int, maxValue int) int {
+	if value <= 0 {
+		value = defaultValue
+	}
+	if maxValue > 0 && value > maxValue {
+		if logger != nil {
+			logger.Warnf("concurrency.%s=%d is high; clamping to %d to avoid memory/process exhaustion", name, value, maxValue)
+		}
+		value = maxValue
+	}
+	return value
+}
+
+func acquireSemaphore(ctx context.Context, sem chan struct{}) error {
+	if sem == nil {
+		return nil
+	}
+	select {
+	case sem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func releaseSemaphore(sem chan struct{}) {
+	if sem != nil {
+		<-sem
 	}
 }
 
@@ -67,14 +97,7 @@ func (u *Unpacker) Process(ctx context.Context, task protocol.TaskPayload, repor
 	}
 
 	report(protocol.StageDownload, 0.05, "downloading bundle")
-	body, err := u.download(ctx, task)
-	if err != nil {
-		return protocol.TaskResultManifest{}, "", taskDir, err
-	}
-
-	report(protocol.StageDeobfuscate, 0.20, "deobfuscating bundle")
-	body = Deobfuscate(body)
-	if err := os.WriteFile(bundlePath, body, 0o644); err != nil {
+	if err := u.downloadBundle(ctx, task, bundlePath); err != nil {
 		return protocol.TaskResultManifest{}, "", taskDir, err
 	}
 
@@ -106,11 +129,11 @@ func (u *Unpacker) Process(ctx context.Context, task protocol.TaskPayload, repor
 	return manifest, archivePath, taskDir, nil
 }
 
-func (u *Unpacker) download(ctx context.Context, task protocol.TaskPayload) ([]byte, error) {
-	client := resty.New()
-	for k, v := range task.Headers {
-		client.SetHeader(k, v)
+func (u *Unpacker) downloadBundle(ctx context.Context, task protocol.TaskPayload, bundlePath string) error {
+	if err := acquireSemaphore(ctx, u.downloadSem); err != nil {
+		return err
 	}
+	defer releaseSemaphore(u.downloadSem)
 
 	const maxRetries = 4
 	var lastErr error
@@ -120,28 +143,65 @@ func (u *Unpacker) download(ctx context.Context, task protocol.TaskPayload) ([]b
 			u.logger.Warnf("download %s attempt %d/%d failed: %v, retrying in %s", task.BundlePath, attempt, maxRetries, lastErr, backoff)
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return ctx.Err()
 			case <-time.After(backoff):
 			}
 		}
-		resp, err := client.R().SetContext(ctx).Get(task.DownloadURL)
-		if err != nil {
+
+		if err := u.downloadBundleOnce(ctx, task, bundlePath); err != nil {
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return ctx.Err()
 			}
-			lastErr = fmt.Errorf("download %s: %w", task.BundlePath, err)
+			lastErr = err
 			continue
 		}
-		if resp.StatusCode() >= 500 {
-			lastErr = fmt.Errorf("download %s returned %d", task.BundlePath, resp.StatusCode())
-			continue
-		}
-		if resp.StatusCode() < 200 || resp.StatusCode() >= 300 {
-			return nil, fmt.Errorf("download %s returned %d", task.BundlePath, resp.StatusCode())
-		}
-		return resp.Body(), nil
+		return nil
 	}
-	return nil, lastErr
+	return lastErr
+}
+
+func (u *Unpacker) downloadBundleOnce(ctx context.Context, task protocol.TaskPayload, bundlePath string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, task.DownloadURL, nil)
+	if err != nil {
+		return err
+	}
+	for k, v := range task.Headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("download %s: %w", task.BundlePath, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("download %s returned %d", task.BundlePath, resp.StatusCode)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("download %s returned %d", task.BundlePath, resp.StatusCode)
+	}
+
+	tmpPath := bundlePath + ".download"
+	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	copyErr := DeobfuscateToWriter(out, resp.Body)
+	closeErr := out.Close()
+	if copyErr != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("download/deobfuscate %s: %w", task.BundlePath, copyErr)
+	}
+	if closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return closeErr
+	}
+	if err := os.Rename(tmpPath, bundlePath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 func (u *Unpacker) ExtractUnityAssetBundle(ctx context.Context, filePath string, exportPath string, outputDir string, category protocol.AssetCategory, options protocol.ExportOptions) error {
@@ -204,7 +264,7 @@ func (u *Unpacker) ExtractUnityAssetBundle(ctx context.Context, filePath string,
 		return fmt.Errorf("failed to export asset bundle %s: %w", filePath, err)
 	}
 	u.logger.Infof("Successfully exported asset bundle: %s", filePath)
-	if err := u.postProcessExportedFiles(actualExportPath, options); err != nil {
+	if err := u.postProcessExportedFiles(ctx, actualExportPath, options); err != nil {
 		return fmt.Errorf("post-processing failed for %s: %w", actualExportPath, err)
 	}
 	return nil
@@ -232,14 +292,14 @@ func getExportGroup(exportPath string) string {
 	return "container"
 }
 
-func (u *Unpacker) postProcessExportedFiles(exportPath string, options protocol.ExportOptions) error {
+func (u *Unpacker) postProcessExportedFiles(ctx context.Context, exportPath string, options protocol.ExportOptions) error {
 	if _, err := os.Stat(exportPath); os.IsNotExist(err) {
 		return nil
 	}
-	if err := u.handleUSMFiles(exportPath, options); err != nil {
+	if err := u.handleUSMFiles(ctx, exportPath, options); err != nil {
 		return fmt.Errorf("failed to handle USM files in %s: %w", exportPath, err)
 	}
-	if err := u.handleACBFiles(exportPath, options); err != nil {
+	if err := u.handleACBFiles(ctx, exportPath, options); err != nil {
 		return fmt.Errorf("failed to handle ACB files in %s: %w", exportPath, err)
 	}
 	if err := handlePNGConversion(exportPath, options); err != nil {
@@ -248,7 +308,7 @@ func (u *Unpacker) postProcessExportedFiles(exportPath string, options protocol.
 	return nil
 }
 
-func (u *Unpacker) handleUSMFiles(exportPath string, options protocol.ExportOptions) error {
+func (u *Unpacker) handleUSMFiles(ctx context.Context, exportPath string, options protocol.ExportOptions) error {
 	usmFiles, err := utils.FindFilesByExtension(exportPath, ".usm")
 	if err != nil {
 		return err
@@ -257,8 +317,10 @@ func (u *Unpacker) handleUSMFiles(exportPath string, options protocol.ExportOpti
 		if len(usmFiles) == 0 {
 			return nil
 		}
-		u.usmSem <- struct{}{}
-		defer func() { <-u.usmSem }()
+		if err := acquireSemaphore(ctx, u.usmSem); err != nil {
+			return err
+		}
+		defer releaseSemaphore(u.usmSem)
 		if len(usmFiles) == 1 {
 			u.logger.Infof("Exporting single USM file: %s", usmFiles[0])
 			return exporter.ExportUSM(usmFiles[0], exportPath, options.ConvertVideoToMP4, options.DirectUSMToMP4WithFFmpeg, options.RemoveM2V, u.cfg.Tools.FFMPEGPath)
@@ -273,44 +335,81 @@ func (u *Unpacker) handleUSMFiles(exportPath string, options protocol.ExportOpti
 	return nil
 }
 
-func (u *Unpacker) handleACBFiles(exportPath string, options protocol.ExportOptions) error {
+func (u *Unpacker) handleACBFiles(ctx context.Context, exportPath string, options protocol.ExportOptions) error {
 	acbFiles, err := utils.FindFilesByExtension(exportPath, ".acb")
 	if err != nil {
 		return err
 	}
-	if options.ExportACBFiles && options.DecodeACBFiles {
-		if len(acbFiles) == 0 {
-			return nil
-		}
-		var wg sync.WaitGroup
-		errChan := make(chan error, len(acbFiles))
-		for _, acbFile := range acbFiles {
-			wg.Add(1)
-			go func(a string) {
-				defer wg.Done()
-				u.acbSem <- struct{}{}
-				defer func() { <-u.acbSem }()
-				u.logger.Infof("Exporting ACB file: %s", a)
-				acbOutputDir := filepath.Dir(a)
-				if err := exporter.ExportACB(a, acbOutputDir, options.DecodeHCAFiles, options.RemoveWav, options.ConvertAudioToMP3, options.ConvertWavToFLAC, u.cfg.Tools.FFMPEGPath, u.cfg.Concurrency.HCA); err != nil {
-					errChan <- fmt.Errorf("failed to export ACB %s: %w", a, err)
+	if !options.ExportACBFiles || !options.DecodeACBFiles || len(acbFiles) == 0 {
+		return nil
+	}
+
+	workerCount := len(acbFiles)
+	if cap(u.acbSem) > 0 && workerCount > cap(u.acbSem) {
+		workerCount = cap(u.acbSem)
+	}
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+
+	jobs := make(chan string)
+	errChan := make(chan error, len(acbFiles))
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for a := range jobs {
+				if err := acquireSemaphore(ctx, u.acbSem); err != nil {
+					errChan <- err
+					continue
 				}
-			}(acbFile)
-		}
-		wg.Wait()
-		close(errChan)
-		var firstErr error
-		errorCount := 0
-		for e := range errChan {
-			errorCount++
-			if firstErr == nil {
-				firstErr = e
+				func() {
+					defer releaseSemaphore(u.acbSem)
+					defer func() {
+						if r := recover(); r != nil {
+							errChan <- fmt.Errorf("panic in ACB export %s: %v", a, r)
+						}
+					}()
+					u.logger.Infof("Exporting ACB file: %s", a)
+					acbOutputDir := filepath.Dir(a)
+					if err := exporter.ExportACB(ctx, a, acbOutputDir, options.DecodeHCAFiles, options.RemoveWav, options.ConvertAudioToMP3, options.ConvertWavToFLAC, u.cfg.Tools.FFMPEGPath, cap(u.hcaSem), u.hcaSem); err != nil {
+						errChan <- fmt.Errorf("failed to export ACB %s: %w", a, err)
+					}
+				}()
 			}
-			u.logger.Warnf("ACB export error: %v", e)
+		}()
+	}
+
+	sendErr := false
+	for _, acbFile := range acbFiles {
+		select {
+		case <-ctx.Done():
+			sendErr = true
+		case jobs <- acbFile:
 		}
-		if errorCount > 0 {
-			return fmt.Errorf("failed to export %d ACB files: %w", errorCount, firstErr)
+		if sendErr {
+			break
 		}
+	}
+	close(jobs)
+	wg.Wait()
+	close(errChan)
+
+	if sendErr {
+		return ctx.Err()
+	}
+	var firstErr error
+	errorCount := 0
+	for e := range errChan {
+		errorCount++
+		if firstErr == nil {
+			firstErr = e
+		}
+		u.logger.Warnf("ACB export error: %v", e)
+	}
+	if errorCount > 0 {
+		return fmt.Errorf("failed to export %d ACB files: %w", errorCount, firstErr)
 	}
 	return nil
 }

@@ -15,6 +15,7 @@ type Config struct {
 	Workspace   WorkspaceConfig   `yaml:"workspace"`
 	Tools       ToolConfig        `yaml:"tools"`
 	Concurrency ConcurrencyConfig `yaml:"concurrency"`
+	Diagnostics DiagnosticsConfig `yaml:"diagnostics"`
 	Logging     LoggingConfig     `yaml:"logging"`
 }
 
@@ -51,6 +52,13 @@ type ConcurrencyConfig struct {
 	ACB      int `yaml:"acb"`
 	USM      int `yaml:"usm"`
 	HCA      int `yaml:"hca"`
+}
+
+type DiagnosticsConfig struct {
+	RuntimeStatsIntervalSeconds int    `yaml:"runtime_stats_interval_seconds"`
+	PprofAddress                string `yaml:"pprof_address"`
+	WarnHeapMB                  uint64 `yaml:"warn_heap_mb"`
+	WarnGoroutines              int    `yaml:"warn_goroutines"`
 }
 
 type LoggingConfig struct {
@@ -142,6 +150,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Concurrency.HCA <= 0 {
 		c.Concurrency.HCA = 16
+	}
+	if c.Diagnostics.WarnHeapMB == 0 {
+		c.Diagnostics.WarnHeapMB = 4096
+	}
+	if c.Diagnostics.WarnGoroutines == 0 {
+		c.Diagnostics.WarnGoroutines = 2000
 	}
 	if c.Logging.Level == "" {
 		c.Logging.Level = "INFO"

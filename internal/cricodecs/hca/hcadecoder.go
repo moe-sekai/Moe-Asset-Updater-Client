@@ -367,6 +367,7 @@ func (d *CriWareHCADecoder) DecodeToWav(w io.Writer) error {
 	}
 
 	pcmBuf := make([]int16, d.info.SamplesPerBlock*d.info.ChannelCount)
+	pcmBytes := make([]byte, len(pcmBuf)*2)
 
 	for {
 		if err := d.readPacket(); err == io.EOF {
@@ -397,7 +398,7 @@ func (d *CriWareHCADecoder) DecodeToWav(w io.Writer) error {
 			return fmt.Errorf("sample range out of bounds: end=%d, buffer_len=%d", end, len(pcmBuf))
 		}
 
-		data := make([]byte, (end-start)*2)
+		data := pcmBytes[:(end-start)*2]
 		for i, sample := range pcmBuf[start:end] {
 			binary.LittleEndian.PutUint16(data[i*2:], uint16(sample))
 		}

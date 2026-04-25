@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -52,6 +55,8 @@ func (w *Worker) Run(ctx context.Context) error {
 		return err
 	}
 	w.logger.Infof("registered as client %s", w.clientID)
+	w.warnOnHighConcurrency()
+	w.startDiagnostics(ctx)
 
 	go w.heartbeatLoop(ctx)
 
@@ -66,7 +71,17 @@ func (w *Worker) Run(ctx context.Context) error {
 		default:
 		}
 
-		tasks, err := w.lease(ctx)
+		available := cap(sem) - len(sem)
+		if available <= 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
+			continue
+		}
+
+		tasks, err := w.lease(ctx, available)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 				return ctx.Err()
@@ -88,7 +103,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			go func(task protocol.TaskPayload) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				w.handleTask(ctx, task)
+				w.runTaskSafely(ctx, task)
 			}(task)
 		}
 	}
@@ -112,6 +127,75 @@ func (w *Worker) register(ctx context.Context) error {
 	}
 	w.clientID = resp.ClientID
 	return nil
+}
+
+func (w *Worker) warnOnHighConcurrency() {
+	if w.cfg.Worker.MaxTasks > 16 {
+		w.logger.Warnf("worker.max_tasks=%d is high; for large bundles consider 4-8 to avoid memory/process exhaustion", w.cfg.Worker.MaxTasks)
+	}
+	if w.cfg.Concurrency.Download > 8 || w.cfg.Concurrency.ACB > 16 || w.cfg.Concurrency.USM > 8 || w.cfg.Concurrency.HCA > 16 {
+		w.logger.Warnf("configured concurrency is high (download=%d acb=%d usm=%d hca=%d); client will clamp internal post-processing limits where possible", w.cfg.Concurrency.Download, w.cfg.Concurrency.ACB, w.cfg.Concurrency.USM, w.cfg.Concurrency.HCA)
+	}
+}
+
+func (w *Worker) startDiagnostics(ctx context.Context) {
+	if w.cfg.Diagnostics.PprofAddress != "" {
+		addr := w.cfg.Diagnostics.PprofAddress
+		go func() {
+			w.logger.Infof("pprof diagnostics listening on %s", addr)
+			if err := http.ListenAndServe(addr, nil); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				w.logger.Warnf("pprof diagnostics stopped: %v", err)
+			}
+		}()
+	}
+	if w.cfg.Diagnostics.RuntimeStatsIntervalSeconds > 0 {
+		go w.runtimeStatsLoop(ctx)
+	}
+}
+
+func (w *Worker) runtimeStatsLoop(ctx context.Context) {
+	interval := time.Duration(w.cfg.Diagnostics.RuntimeStatsIntervalSeconds) * time.Second
+	if interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.logRuntimeStats()
+		}
+	}
+}
+
+func (w *Worker) logRuntimeStats() {
+	var mem runtime.MemStats
+	runtime.ReadMemStats(&mem)
+	goroutines := runtime.NumGoroutine()
+	active := w.activeTaskCount()
+	w.logger.Infof("runtime stats: goroutines=%d active_tasks=%d heap_alloc=%s heap_sys=%s stack_inuse=%s next_gc=%s gc=%d", goroutines, active, formatBytes(mem.HeapAlloc), formatBytes(mem.HeapSys), formatBytes(mem.StackInuse), formatBytes(mem.NextGC), mem.NumGC)
+	if w.cfg.Diagnostics.WarnGoroutines > 0 && goroutines >= w.cfg.Diagnostics.WarnGoroutines {
+		w.logger.Warnf("goroutine count %d reached warning threshold %d", goroutines, w.cfg.Diagnostics.WarnGoroutines)
+	}
+	warnHeap := w.cfg.Diagnostics.WarnHeapMB * 1024 * 1024
+	if warnHeap > 0 && mem.HeapAlloc >= warnHeap {
+		w.logger.Warnf("heap allocation %s reached warning threshold %s", formatBytes(mem.HeapAlloc), formatBytes(warnHeap))
+	}
+}
+
+func formatBytes(v uint64) string {
+	const unit = 1024
+	if v < unit {
+		return fmt.Sprintf("%dB", v)
+	}
+	div, exp := uint64(unit), 0
+	for n := v / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f%ciB", float64(v)/float64(div), "KMGTPE"[exp])
 }
 
 func (w *Worker) heartbeatLoop(ctx context.Context) {
@@ -141,12 +225,16 @@ func (w *Worker) heartbeat(ctx context.Context) error {
 	return nil
 }
 
-func (w *Worker) lease(ctx context.Context) ([]protocol.TaskPayload, error) {
+func (w *Worker) lease(ctx context.Context, maxTasks int) ([]protocol.TaskPayload, error) {
+	if maxTasks <= 0 || maxTasks > w.cfg.Worker.MaxTasks {
+		maxTasks = w.cfg.Worker.MaxTasks
+	}
 	req := protocol.LeaseRequest{
 		ClientID:    w.clientID,
-		MaxTasks:    w.cfg.Worker.MaxTasks,
+		MaxTasks:    maxTasks,
 		WaitSeconds: w.cfg.LeaseWaitSeconds(),
 	}
+
 	var resp protocol.LeaseResponse
 	r, err := w.http.R().SetContext(ctx).SetBody(req).SetResult(&resp).Post("/api/v1/tasks/lease")
 	if err != nil {
@@ -156,6 +244,21 @@ func (w *Worker) lease(ctx context.Context) ([]protocol.TaskPayload, error) {
 		return nil, fmt.Errorf("lease returned %d: %s", r.StatusCode(), r.String())
 	}
 	return resp.Tasks, nil
+}
+
+func (w *Worker) runTaskSafely(parent context.Context, task protocol.TaskPayload) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			w.logger.Errorf("task %s panicked: %v\n%s", task.TaskID, r, stack)
+			failCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := w.fail(failCtx, task.TaskID, fmt.Sprintf("panic: %v", r)); err != nil {
+				w.logger.Warnf("failed to report panic for %s: %v", task.TaskID, err)
+			}
+		}
+	}()
+	w.handleTask(parent, task)
 }
 
 func (w *Worker) handleTask(parent context.Context, task protocol.TaskPayload) {
@@ -251,6 +354,12 @@ func (w *Worker) activeTaskIDs() []string {
 		out = append(out, taskID)
 	}
 	return out
+}
+
+func (w *Worker) activeTaskCount() int {
+	w.activeMu.Lock()
+	defer w.activeMu.Unlock()
+	return len(w.active)
 }
 
 func (w *Worker) cleanupTaskDir(taskDir string, failed bool) {

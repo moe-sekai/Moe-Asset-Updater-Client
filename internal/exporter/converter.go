@@ -16,6 +16,33 @@ type FrameRate struct {
 	Denominator int
 }
 
+type limitedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.limit <= 0 || b.buf.Len() < b.limit {
+		remaining := b.limit - b.buf.Len()
+		if b.limit <= 0 || remaining > len(p) {
+			remaining = len(p)
+		}
+		if remaining > 0 {
+			_, _ = b.buf.Write(p[:remaining])
+		}
+	}
+	return len(p), nil
+}
+
+func (b *limitedBuffer) String() string {
+	return b.buf.String()
+}
+
+func ffmpegBaseArgs(args ...string) []string {
+	base := []string{"-hide_banner", "-nostats", "-loglevel", "error"}
+	return append(base, args...)
+}
+
 func (f FrameRate) String() string {
 	if f.Denominator <= 1 {
 		return strconv.Itoa(f.Numerator)
@@ -24,15 +51,18 @@ func (f FrameRate) String() string {
 }
 
 func ConvertPNGToWebP(pngFile string, webpFile string) error {
-	// Read and decode PNG
-	pngData, err := os.ReadFile(pngFile)
+	// Decode PNG from a file stream instead of reading the full image into memory first.
+	inFile, err := os.Open(pngFile)
 	if err != nil {
-		return fmt.Errorf("failed to read PNG file: %w", err)
+		return fmt.Errorf("failed to open PNG file: %w", err)
 	}
-
-	img, err := png.Decode(bytes.NewReader(pngData))
+	img, err := png.Decode(inFile)
+	closeErr := inFile.Close()
 	if err != nil {
 		return fmt.Errorf("failed to decode PNG: %w", err)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("failed to close PNG file: %w", closeErr)
 	}
 
 	// Encode to WebP (VP8L lossless)
@@ -62,11 +92,12 @@ func ConvertM2VToMP4(m2vFile string, mp4File string, deleteOriginal bool, ffmpeg
 		args = append(args, "-r", frameRate.String())
 	}
 	args = append(args, "-y", mp4File)
+	args = ffmpegBaseArgs(args...)
 
-	var stderr bytes.Buffer
+	stderr := &limitedBuffer{limit: 64 * 1024}
 	cmd := exec.Command(ffmpegPath, args...)
 	cmd.Stdout = nil
-	cmd.Stderr = &stderr
+	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to convert M2V to MP4: %w\nffmpeg stderr: %s", err, stderr.String())
 	}
@@ -83,19 +114,19 @@ func ConvertM2VToMP4(m2vFile string, mp4File string, deleteOriginal bool, ffmpeg
 }
 
 func ConvertUSMToMP4(usmFile string, mp4File string, ffmpegPath string) error {
-	args := []string{
+	args := ffmpegBaseArgs(
 		"-i", usmFile,
 		"-c:v", "libx264",
 		"-c:a", "aac",
 		"-b:a", "192k",
 		"-movflags", "+faststart",
 		"-y", mp4File,
-	}
+	)
 
-	var stderr bytes.Buffer
+	stderr := &limitedBuffer{limit: 64 * 1024}
 	cmd := exec.Command(ffmpegPath, args...)
 	cmd.Stdout = nil
-	cmd.Stderr = &stderr
+	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to convert USM to MP4: %w\nffmpeg stderr: %s", err, stderr.String())
 	}
@@ -107,7 +138,8 @@ func ConvertUSMToMP4(usmFile string, mp4File string, ffmpegPath string) error {
 }
 
 func ConvertWavToFLAC(wavFile string, flacFile string, deleteOriginal bool, ffmpegPath string) error {
-	cmd := exec.Command(ffmpegPath, "-i", wavFile, "-compression_level", "12", "-y", flacFile)
+	args := ffmpegBaseArgs("-i", wavFile, "-compression_level", "12", "-y", flacFile)
+	cmd := exec.Command(ffmpegPath, args...)
 	cmd.Stdout = nil
 	cmd.Stderr = nil
 	if err := cmd.Run(); err != nil {
@@ -127,10 +159,11 @@ func ConvertWavToFLAC(wavFile string, flacFile string, deleteOriginal bool, ffmp
 }
 
 func ConvertWavToMP3(wavFile string, mp3File string, deleteOriginal bool, ffmpegPath string) error {
-	var stderr bytes.Buffer
-	cmd := exec.Command(ffmpegPath, "-i", wavFile, "-b:a", "320k", "-y", mp3File)
+	stderr := &limitedBuffer{limit: 64 * 1024}
+	args := ffmpegBaseArgs("-i", wavFile, "-b:a", "320k", "-y", mp3File)
+	cmd := exec.Command(ffmpegPath, args...)
 	cmd.Stdout = nil
-	cmd.Stderr = &stderr
+	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("failed to convert WAV to MP3: %w\nffmpeg stderr: %s", err, stderr.String())
 	}
