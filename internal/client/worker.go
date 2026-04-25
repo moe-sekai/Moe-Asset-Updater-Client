@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -130,15 +132,16 @@ func (w *Worker) register(ctx context.Context) error {
 }
 
 func (w *Worker) warnOnHighConcurrency() {
-	if w.cfg.Worker.MaxTasks > 16 {
-		w.logger.Warnf("worker.max_tasks=%d is high; for large bundles consider 4-8 to avoid memory/process exhaustion", w.cfg.Worker.MaxTasks)
+	if w.cfg.Worker.MaxTasks > 4 {
+		w.logger.Warnf("worker.max_tasks=%d is high for AssetStudio workloads; use 1-2 on small containers and 4 only with plenty of RAM", w.cfg.Worker.MaxTasks)
 	}
-	if w.cfg.Concurrency.Download > 8 || w.cfg.Concurrency.ACB > 16 || w.cfg.Concurrency.USM > 8 || w.cfg.Concurrency.HCA > 16 {
-		w.logger.Warnf("configured concurrency is high (download=%d acb=%d usm=%d hca=%d); client will clamp internal post-processing limits where possible", w.cfg.Concurrency.Download, w.cfg.Concurrency.ACB, w.cfg.Concurrency.USM, w.cfg.Concurrency.HCA)
+	if w.cfg.Concurrency.Download > 4 || w.cfg.Concurrency.AssetStudio > 2 || w.cfg.Concurrency.PostProcess > 2 || w.cfg.Concurrency.ACB > 8 || w.cfg.Concurrency.USM > 4 || w.cfg.Concurrency.HCA > 8 {
+		w.logger.Warnf("configured concurrency is high (download=%d asset_studio=%d postprocess=%d acb=%d usm=%d hca=%d); client will clamp internal post-processing limits where possible", w.cfg.Concurrency.Download, w.cfg.Concurrency.AssetStudio, w.cfg.Concurrency.PostProcess, w.cfg.Concurrency.ACB, w.cfg.Concurrency.USM, w.cfg.Concurrency.HCA)
 	}
 }
 
 func (w *Worker) startDiagnostics(ctx context.Context) {
+	w.logRuntimeStats()
 	if w.cfg.Diagnostics.PprofAddress != "" {
 		addr := w.cfg.Diagnostics.PprofAddress
 		go func() {
@@ -175,7 +178,14 @@ func (w *Worker) logRuntimeStats() {
 	runtime.ReadMemStats(&mem)
 	goroutines := runtime.NumGoroutine()
 	active := w.activeTaskCount()
-	w.logger.Infof("runtime stats: goroutines=%d active_tasks=%d heap_alloc=%s heap_sys=%s stack_inuse=%s next_gc=%s gc=%d", goroutines, active, formatBytes(mem.HeapAlloc), formatBytes(mem.HeapSys), formatBytes(mem.StackInuse), formatBytes(mem.NextGC), mem.NumGC)
+	if current, limit, ok := cgroupMemory(); ok {
+		w.logger.Infof("runtime stats: goroutines=%d active_tasks=%d heap_alloc=%s heap_sys=%s stack_inuse=%s next_gc=%s gc=%d cgroup_memory=%s/%s", goroutines, active, formatBytes(mem.HeapAlloc), formatBytes(mem.HeapSys), formatBytes(mem.StackInuse), formatBytes(mem.NextGC), mem.NumGC, formatBytes(current), formatLimit(limit))
+		if limit > 0 && current*100/limit >= 85 {
+			w.logger.Warnf("cgroup memory usage is high: %s/%s", formatBytes(current), formatBytes(limit))
+		}
+	} else {
+		w.logger.Infof("runtime stats: goroutines=%d active_tasks=%d heap_alloc=%s heap_sys=%s stack_inuse=%s next_gc=%s gc=%d", goroutines, active, formatBytes(mem.HeapAlloc), formatBytes(mem.HeapSys), formatBytes(mem.StackInuse), formatBytes(mem.NextGC), mem.NumGC)
+	}
 	if w.cfg.Diagnostics.WarnGoroutines > 0 && goroutines >= w.cfg.Diagnostics.WarnGoroutines {
 		w.logger.Warnf("goroutine count %d reached warning threshold %d", goroutines, w.cfg.Diagnostics.WarnGoroutines)
 	}
@@ -183,6 +193,47 @@ func (w *Worker) logRuntimeStats() {
 	if warnHeap > 0 && mem.HeapAlloc >= warnHeap {
 		w.logger.Warnf("heap allocation %s reached warning threshold %s", formatBytes(mem.HeapAlloc), formatBytes(warnHeap))
 	}
+}
+
+func cgroupMemory() (uint64, uint64, bool) {
+	if current, ok := readUintFile("/sys/fs/cgroup/memory.current"); ok {
+		limit, _ := readUintOrMaxFile("/sys/fs/cgroup/memory.max")
+		return current, limit, true
+	}
+	if current, ok := readUintFile("/sys/fs/cgroup/memory/memory.usage_in_bytes"); ok {
+		limit, _ := readUintFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+		return current, limit, true
+	}
+	return 0, 0, false
+}
+
+func readUintOrMaxFile(path string) (uint64, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	value := strings.TrimSpace(string(data))
+	if value == "max" {
+		return 0, true
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	return parsed, err == nil
+}
+
+func readUintFile(path string) (uint64, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	parsed, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	return parsed, err == nil
+}
+
+func formatLimit(v uint64) string {
+	if v == 0 {
+		return "unlimited"
+	}
+	return formatBytes(v)
 }
 
 func formatBytes(v uint64) string {

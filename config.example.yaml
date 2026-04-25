@@ -30,13 +30,17 @@ tools:
 
 concurrency:
   download: 2
-  acb: 4
-  usm: 2
-  hca: 4
+  # AssetStudio is the largest memory spike. Keep at 1 unless the container has plenty of RAM.
+  asset_studio: 1
+  # Post-processing can decode images/audio/video; keep low to avoid OOM.
+  postprocess: 1
+  acb: 2
+  usm: 1
+  hca: 2
 
 diagnostics:
-  # Set to e.g. 60 to log heap/goroutine stats once per minute.
-  runtime_stats_interval_seconds: 0
+  # Logs heap/goroutine stats every N seconds. Set -1 to disable.
+  runtime_stats_interval_seconds: 60
   # Set to e.g. "127.0.0.1:6060" to enable net/http/pprof.
   pprof_address: ""
   warn_heap_mb: 4096

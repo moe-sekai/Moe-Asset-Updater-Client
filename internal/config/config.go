@@ -48,10 +48,12 @@ type ToolConfig struct {
 }
 
 type ConcurrencyConfig struct {
-	Download int `yaml:"download"`
-	ACB      int `yaml:"acb"`
-	USM      int `yaml:"usm"`
-	HCA      int `yaml:"hca"`
+	Download    int `yaml:"download"`
+	AssetStudio int `yaml:"asset_studio"`
+	PostProcess int `yaml:"postprocess"`
+	ACB         int `yaml:"acb"`
+	USM         int `yaml:"usm"`
+	HCA         int `yaml:"hca"`
 }
 
 type DiagnosticsConfig struct {
@@ -142,14 +144,23 @@ func (c *Config) applyDefaults() {
 	if c.Concurrency.Download <= 0 {
 		c.Concurrency.Download = 2
 	}
+	if c.Concurrency.AssetStudio <= 0 {
+		c.Concurrency.AssetStudio = 1
+	}
+	if c.Concurrency.PostProcess <= 0 {
+		c.Concurrency.PostProcess = 1
+	}
 	if c.Concurrency.ACB <= 0 {
-		c.Concurrency.ACB = 16
+		c.Concurrency.ACB = 4
 	}
 	if c.Concurrency.USM <= 0 {
-		c.Concurrency.USM = 4
+		c.Concurrency.USM = 2
 	}
 	if c.Concurrency.HCA <= 0 {
-		c.Concurrency.HCA = 16
+		c.Concurrency.HCA = 4
+	}
+	if c.Diagnostics.RuntimeStatsIntervalSeconds == 0 {
+		c.Diagnostics.RuntimeStatsIntervalSeconds = 60
 	}
 	if c.Diagnostics.WarnHeapMB == 0 {
 		c.Diagnostics.WarnHeapMB = 4096

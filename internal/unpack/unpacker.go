@@ -28,26 +28,32 @@ import (
 type ProgressFunc func(stage protocol.ProgressStage, progress float64, message string)
 
 type Unpacker struct {
-	cfg         *config.Config
-	logger      *harukiLogger.Logger
-	downloadSem chan struct{}
-	usmSem      chan struct{}
-	acbSem      chan struct{}
-	hcaSem      chan struct{}
+	cfg            *config.Config
+	logger         *harukiLogger.Logger
+	downloadSem    chan struct{}
+	assetStudioSem chan struct{}
+	postProcessSem chan struct{}
+	usmSem         chan struct{}
+	acbSem         chan struct{}
+	hcaSem         chan struct{}
 }
 
 func New(cfg *config.Config, logger *harukiLogger.Logger) *Unpacker {
-	download := effectiveConcurrency(logger, "download", cfg.Concurrency.Download, 2, 8)
-	usm := effectiveConcurrency(logger, "usm", cfg.Concurrency.USM, 4, 8)
-	acb := effectiveConcurrency(logger, "acb", cfg.Concurrency.ACB, 16, 16)
-	hca := effectiveConcurrency(logger, "hca", cfg.Concurrency.HCA, 16, 16)
+	download := effectiveConcurrency(logger, "download", cfg.Concurrency.Download, 2, 4)
+	assetStudio := effectiveConcurrency(logger, "asset_studio", cfg.Concurrency.AssetStudio, 1, 2)
+	postProcess := effectiveConcurrency(logger, "postprocess", cfg.Concurrency.PostProcess, 1, 2)
+	usm := effectiveConcurrency(logger, "usm", cfg.Concurrency.USM, 2, 4)
+	acb := effectiveConcurrency(logger, "acb", cfg.Concurrency.ACB, 4, 8)
+	hca := effectiveConcurrency(logger, "hca", cfg.Concurrency.HCA, 4, 8)
 	return &Unpacker{
-		cfg:         cfg,
-		logger:      logger,
-		downloadSem: make(chan struct{}, download),
-		usmSem:      make(chan struct{}, usm),
-		acbSem:      make(chan struct{}, acb),
-		hcaSem:      make(chan struct{}, hca),
+		cfg:            cfg,
+		logger:         logger,
+		downloadSem:    make(chan struct{}, download),
+		assetStudioSem: make(chan struct{}, assetStudio),
+		postProcessSem: make(chan struct{}, postProcess),
+		usmSem:         make(chan struct{}, usm),
+		acbSem:         make(chan struct{}, acb),
+		hcaSem:         make(chan struct{}, hca),
 	}
 }
 
@@ -102,8 +108,13 @@ func (u *Unpacker) Process(ctx context.Context, task protocol.TaskPayload, repor
 	}
 
 	report(protocol.StageAssetStudioExport, 0.30, "exporting bundle")
-	if err := u.ExtractUnityAssetBundle(ctx, bundlePath, task.BundlePath, exportRoot, task.Category, task.Export); err != nil {
+	if err := acquireSemaphore(ctx, u.assetStudioSem); err != nil {
 		return protocol.TaskResultManifest{}, "", taskDir, err
+	}
+	exportErr := u.ExtractUnityAssetBundle(ctx, bundlePath, task.BundlePath, exportRoot, task.Category, task.Export)
+	releaseSemaphore(u.assetStudioSem)
+	if exportErr != nil {
+		return protocol.TaskResultManifest{}, "", taskDir, exportErr
 	}
 	_ = os.Remove(bundlePath)
 
@@ -296,6 +307,10 @@ func (u *Unpacker) postProcessExportedFiles(ctx context.Context, exportPath stri
 	if _, err := os.Stat(exportPath); os.IsNotExist(err) {
 		return nil
 	}
+	if err := acquireSemaphore(ctx, u.postProcessSem); err != nil {
+		return err
+	}
+	defer releaseSemaphore(u.postProcessSem)
 	if err := u.handleUSMFiles(ctx, exportPath, options); err != nil {
 		return fmt.Errorf("failed to handle USM files in %s: %w", exportPath, err)
 	}
