@@ -11,8 +11,8 @@ worker:
   id: ""
   name: ""
   version: ""
-  # Keep this modest: each task may launch AssetStudio/ffmpeg and decode audio.
-  max_tasks: 4
+  # Overall task concurrency. Increase on high-memory machines; lower if cgroup memory approaches the limit.
+  max_tasks: 8
   heartbeat_interval_seconds: 30
   lease_wait_seconds: 30
   tags:
@@ -29,14 +29,14 @@ tools:
   asset_studio_cli_path: "/app/assetstudio/AssetStudioCLI"
 
 concurrency:
-  download: 2
-  # AssetStudio is the largest memory spike. Keep at 1 unless the container has plenty of RAM.
-  asset_studio: 1
-  # Post-processing can decode images/audio/video; keep low to avoid OOM.
-  postprocess: 1
-  acb: 2
-  usm: 1
-  hca: 2
+  download: 4
+  # 0/omitted means follow worker.max_tasks, matching the initial high-throughput behavior.
+  # Set these to 1-2 only on small containers that still hit the OOM killer.
+  asset_studio: 0
+  postprocess: 0
+  acb: 16
+  usm: 4
+  hca: 16
 
 diagnostics:
   # Logs heap/goroutine stats every N seconds. Set -1 to disable.

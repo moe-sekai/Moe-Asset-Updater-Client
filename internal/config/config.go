@@ -144,20 +144,14 @@ func (c *Config) applyDefaults() {
 	if c.Concurrency.Download <= 0 {
 		c.Concurrency.Download = 2
 	}
-	if c.Concurrency.AssetStudio <= 0 {
-		c.Concurrency.AssetStudio = 1
-	}
-	if c.Concurrency.PostProcess <= 0 {
-		c.Concurrency.PostProcess = 1
-	}
 	if c.Concurrency.ACB <= 0 {
-		c.Concurrency.ACB = 4
+		c.Concurrency.ACB = 16
 	}
 	if c.Concurrency.USM <= 0 {
-		c.Concurrency.USM = 2
+		c.Concurrency.USM = 4
 	}
 	if c.Concurrency.HCA <= 0 {
-		c.Concurrency.HCA = 4
+		c.Concurrency.HCA = 16
 	}
 	if c.Diagnostics.RuntimeStatsIntervalSeconds == 0 {
 		c.Diagnostics.RuntimeStatsIntervalSeconds = 60

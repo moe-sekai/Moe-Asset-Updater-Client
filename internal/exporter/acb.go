@@ -76,10 +76,6 @@ func exportHCAFiles(ctx context.Context, hcaFiles []string, extractDir string, c
 	if maxWorkers <= 0 {
 		maxWorkers = 16
 	}
-	const maxWorkersPerACB = 4
-	if maxWorkers > maxWorkersPerACB {
-		maxWorkers = maxWorkersPerACB
-	}
 	if maxWorkers > len(hcaFiles) {
 		maxWorkers = len(hcaFiles)
 	}

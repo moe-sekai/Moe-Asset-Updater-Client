@@ -57,6 +57,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		return err
 	}
 	w.logger.Infof("registered as client %s", w.clientID)
+	w.configureMemoryLimit()
 	w.warnOnHighConcurrency()
 	w.startDiagnostics(ctx)
 
@@ -131,12 +132,33 @@ func (w *Worker) register(ctx context.Context) error {
 	return nil
 }
 
-func (w *Worker) warnOnHighConcurrency() {
-	if w.cfg.Worker.MaxTasks > 4 {
-		w.logger.Warnf("worker.max_tasks=%d is high for AssetStudio workloads; use 1-2 on small containers and 4 only with plenty of RAM", w.cfg.Worker.MaxTasks)
+func (w *Worker) configureMemoryLimit() {
+	if _, ok := os.LookupEnv("GOMEMLIMIT"); ok {
+		return
 	}
-	if w.cfg.Concurrency.Download > 4 || w.cfg.Concurrency.AssetStudio > 2 || w.cfg.Concurrency.PostProcess > 2 || w.cfg.Concurrency.ACB > 8 || w.cfg.Concurrency.USM > 4 || w.cfg.Concurrency.HCA > 8 {
-		w.logger.Warnf("configured concurrency is high (download=%d asset_studio=%d postprocess=%d acb=%d usm=%d hca=%d); client will clamp internal post-processing limits where possible", w.cfg.Concurrency.Download, w.cfg.Concurrency.AssetStudio, w.cfg.Concurrency.PostProcess, w.cfg.Concurrency.ACB, w.cfg.Concurrency.USM, w.cfg.Concurrency.HCA)
+	_, limit, ok := cgroupMemory()
+	if !ok || limit == 0 {
+		return
+	}
+	memoryLimit := int64(limit * 60 / 100)
+	if memoryLimit <= 0 {
+		return
+	}
+	previous := debug.SetMemoryLimit(memoryLimit)
+	w.logger.Infof("auto GOMEMLIMIT set to %s from cgroup limit %s (previous=%s)", formatBytes(uint64(memoryLimit)), formatBytes(limit), formatLimit(uint64(previous)))
+}
+
+func (w *Worker) warnOnHighConcurrency() {
+	assetStudio := w.cfg.Concurrency.AssetStudio
+	if assetStudio <= 0 {
+		assetStudio = w.cfg.Worker.MaxTasks
+	}
+	postProcess := w.cfg.Concurrency.PostProcess
+	if postProcess <= 0 {
+		postProcess = w.cfg.Worker.MaxTasks
+	}
+	if w.cfg.Worker.MaxTasks >= 64 || assetStudio >= 64 || postProcess >= 64 || w.cfg.Concurrency.ACB >= 64 || w.cfg.Concurrency.USM >= 64 || w.cfg.Concurrency.HCA >= 64 {
+		w.logger.Warnf("high concurrency enabled (max_tasks=%d download=%d asset_studio=%d postprocess=%d acb=%d usm=%d hca=%d); performance mode is allowed, but reduce these if cgroup memory approaches the limit", w.cfg.Worker.MaxTasks, w.cfg.Concurrency.Download, assetStudio, postProcess, w.cfg.Concurrency.ACB, w.cfg.Concurrency.USM, w.cfg.Concurrency.HCA)
 	}
 }
 
@@ -170,6 +192,22 @@ func (w *Worker) runtimeStatsLoop(ctx context.Context) {
 		case <-ticker.C:
 			w.logRuntimeStats()
 		}
+	}
+}
+
+func (w *Worker) releaseMemoryAfterTask(taskID string) {
+	current, limit, ok := cgroupMemory()
+	if !ok || limit == 0 || current*100/limit < 60 {
+		return
+	}
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	runtime.GC()
+	debug.FreeOSMemory()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	if currentAfter, limitAfter, ok := cgroupMemory(); ok {
+		w.logger.Infof("released memory after task %s: heap_alloc %s -> %s, heap_sys %s -> %s, cgroup %s/%s -> %s/%s", taskID, formatBytes(before.HeapAlloc), formatBytes(after.HeapAlloc), formatBytes(before.HeapSys), formatBytes(after.HeapSys), formatBytes(current), formatBytes(limit), formatBytes(currentAfter), formatLimit(limitAfter))
 	}
 }
 
@@ -315,6 +353,7 @@ func (w *Worker) runTaskSafely(parent context.Context, task protocol.TaskPayload
 func (w *Worker) handleTask(parent context.Context, task protocol.TaskPayload) {
 	w.addActive(task.TaskID)
 	defer w.removeActive(task.TaskID)
+	defer w.releaseMemoryAfterTask(task.TaskID)
 
 	ctx, cancel := context.WithTimeout(parent, time.Duration(w.cfg.Client.TimeoutSeconds)*time.Second)
 	defer cancel()

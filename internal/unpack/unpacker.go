@@ -39,12 +39,20 @@ type Unpacker struct {
 }
 
 func New(cfg *config.Config, logger *harukiLogger.Logger) *Unpacker {
-	download := effectiveConcurrency(logger, "download", cfg.Concurrency.Download, 2, 4)
-	assetStudio := effectiveConcurrency(logger, "asset_studio", cfg.Concurrency.AssetStudio, 1, 2)
-	postProcess := effectiveConcurrency(logger, "postprocess", cfg.Concurrency.PostProcess, 1, 2)
-	usm := effectiveConcurrency(logger, "usm", cfg.Concurrency.USM, 2, 4)
-	acb := effectiveConcurrency(logger, "acb", cfg.Concurrency.ACB, 4, 8)
-	hca := effectiveConcurrency(logger, "hca", cfg.Concurrency.HCA, 4, 8)
+	download := effectiveConcurrency(logger, "download", cfg.Concurrency.Download, 2, 0)
+	assetStudio := cfg.Concurrency.AssetStudio
+	if assetStudio <= 0 {
+		assetStudio = cfg.Worker.MaxTasks
+	}
+	assetStudio = effectiveConcurrency(logger, "asset_studio", assetStudio, cfg.Worker.MaxTasks, 0)
+	postProcess := cfg.Concurrency.PostProcess
+	if postProcess <= 0 {
+		postProcess = cfg.Worker.MaxTasks
+	}
+	postProcess = effectiveConcurrency(logger, "postprocess", postProcess, cfg.Worker.MaxTasks, 0)
+	usm := effectiveConcurrency(logger, "usm", cfg.Concurrency.USM, 4, 0)
+	acb := effectiveConcurrency(logger, "acb", cfg.Concurrency.ACB, 16, 0)
+	hca := effectiveConcurrency(logger, "hca", cfg.Concurrency.HCA, 16, 0)
 	return &Unpacker{
 		cfg:            cfg,
 		logger:         logger,
@@ -63,9 +71,12 @@ func effectiveConcurrency(logger *harukiLogger.Logger, name string, value int, d
 	}
 	if maxValue > 0 && value > maxValue {
 		if logger != nil {
-			logger.Warnf("concurrency.%s=%d is high; clamping to %d to avoid memory/process exhaustion", name, value, maxValue)
+			logger.Warnf("concurrency.%s=%d is high; clamping to %d", name, value, maxValue)
 		}
 		value = maxValue
+	}
+	if value >= 64 && logger != nil {
+		logger.Warnf("concurrency.%s=%d is high; this is allowed, but rely on GOMEMLIMIT/container memory or lower it if OOM killer appears", name, value)
 	}
 	return value
 }
