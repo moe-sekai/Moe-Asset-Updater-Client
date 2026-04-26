@@ -134,9 +134,17 @@ func (u *Unpacker) Process(ctx context.Context, task protocol.TaskPayload, repor
 	}
 	_ = os.Remove(bundlePath)
 
+	report(protocol.StagePostProcess, 0.78, "finalizing exported audio")
+	if err := u.finalizeExportRoot(ctx, exportRoot, task.Export); err != nil {
+		return protocol.TaskResultManifest{}, "", taskDir, err
+	}
+
 	report(protocol.StagePostProcess, 0.80, "building manifest")
 	manifest, err := buildManifest(exportRoot, task)
 	if err != nil {
+		return protocol.TaskResultManifest{}, "", taskDir, err
+	}
+	if err := validateExpectedManifestOutputs(manifest, task.Export); err != nil {
 		return protocol.TaskResultManifest{}, "", taskDir, err
 	}
 	manifestPath := filepath.Join(taskDir, "manifest.json")
@@ -333,11 +341,22 @@ func (u *Unpacker) postProcessExportedFiles(ctx context.Context, exportPath stri
 	if err := u.handleACBFiles(ctx, exportPath, options); err != nil {
 		return fmt.Errorf("failed to handle ACB files in %s: %w", exportPath, err)
 	}
-	if err := handleStandaloneWAVFiles(exportPath, options, u.cfg.Tools.FFMPEGPath); err != nil {
+	if err := handleStandaloneWAVFiles(exportPath, options, u.cfg.Tools.FFMPEGPath, u.logger); err != nil {
 		return fmt.Errorf("failed to handle WAV conversion in %s: %w", exportPath, err)
 	}
 	if err := handlePNGConversion(exportPath, options); err != nil {
 		return fmt.Errorf("failed to handle PNG conversion in %s: %w", exportPath, err)
+	}
+	return nil
+}
+
+func (u *Unpacker) finalizeExportRoot(ctx context.Context, exportRoot string, options protocol.ExportOptions) error {
+	if err := acquireSemaphore(ctx, u.postProcessSem); err != nil {
+		return err
+	}
+	defer releaseSemaphore(u.postProcessSem)
+	if err := handleStandaloneWAVFiles(exportRoot, options, u.cfg.Tools.FFMPEGPath, u.logger); err != nil {
+		return fmt.Errorf("failed to finalize WAV files in %s: %w", exportRoot, err)
 	}
 	return nil
 }
@@ -452,13 +471,16 @@ func (u *Unpacker) handleACBFiles(ctx context.Context, exportPath string, option
 	return nil
 }
 
-func handleStandaloneWAVFiles(exportPath string, options protocol.ExportOptions, ffmpegPath string) error {
+func handleStandaloneWAVFiles(exportPath string, options protocol.ExportOptions, ffmpegPath string, logger *harukiLogger.Logger) error {
 	if !options.ConvertAudioToMP3 && !options.ConvertWavToFLAC && !options.RemoveWav {
 		return nil
 	}
 	wavFiles, err := utils.FindFilesByExtension(exportPath, ".wav")
 	if err != nil {
 		return err
+	}
+	if len(wavFiles) > 0 && logger != nil {
+		logger.Infof("Found %d standalone WAV files in %s, applying audio export options", len(wavFiles), exportPath)
 	}
 	for _, wavFile := range wavFiles {
 		basePath := strings.TrimSuffix(wavFile, filepath.Ext(wavFile))
@@ -575,6 +597,61 @@ func mergeUSMFiles(dir string, usmFiles []string) (string, error) {
 		}
 	}
 	return mergedFilePath, nil
+}
+
+func validateExpectedManifestOutputs(manifest protocol.TaskResultManifest, export protocol.ExportOptions) error {
+	counts := make(map[string]int)
+	samples := make(map[string][]string)
+	for _, file := range manifest.Files {
+		ext := strings.ToLower(filepath.Ext(file.Path))
+		switch ext {
+		case ".wav", ".mp3", ".flac", ".m2v", ".mp4", ".png", ".webp":
+			counts[ext]++
+			if len(samples[ext]) < 3 {
+				samples[ext] = append(samples[ext], file.Path)
+			}
+		}
+	}
+	has := func(ext string) bool { return counts[ext] > 0 }
+
+	if export.ConvertAudioToMP3 && export.ExportACBFiles && export.DecodeACBFiles {
+		if has(".wav") && !has(".mp3") {
+			return fmt.Errorf("expected MP3 output before upload but result contains WAV without MP3 (%s)", expectedOutputSummary(counts, samples, ".wav", ".mp3"))
+		}
+	}
+	if export.ConvertWavToFLAC && export.ExportACBFiles && export.DecodeACBFiles {
+		if has(".wav") && !has(".flac") {
+			return fmt.Errorf("expected FLAC output before upload but result contains WAV without FLAC (%s)", expectedOutputSummary(counts, samples, ".wav", ".flac"))
+		}
+	}
+	if export.RemoveWav && (export.ConvertAudioToMP3 || export.ConvertWavToFLAC) {
+		if has(".wav") {
+			return fmt.Errorf("expected WAV files to be removed before upload (%s)", expectedOutputSummary(counts, samples, ".wav", ".mp3", ".flac"))
+		}
+	}
+	if export.ConvertVideoToMP4 {
+		if has(".m2v") && !has(".mp4") {
+			return fmt.Errorf("expected MP4 output before upload but result contains M2V without MP4 (%s)", expectedOutputSummary(counts, samples, ".m2v", ".mp4"))
+		}
+	}
+	if export.ConvertPhotoToWebP && export.RemovePNG {
+		if has(".png") && !has(".webp") {
+			return fmt.Errorf("expected WebP output before upload but result contains PNG without WebP (%s)", expectedOutputSummary(counts, samples, ".png", ".webp"))
+		}
+	}
+	return nil
+}
+
+func expectedOutputSummary(counts map[string]int, samples map[string][]string, exts ...string) string {
+	parts := make([]string, 0, len(exts)*2)
+	for _, ext := range exts {
+		label := strings.TrimPrefix(ext, ".")
+		parts = append(parts, fmt.Sprintf("%s=%d", label, counts[ext]))
+		if len(samples[ext]) > 0 {
+			parts = append(parts, fmt.Sprintf("%s_samples=%v", label, samples[ext]))
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func buildManifest(root string, task protocol.TaskPayload) (protocol.TaskResultManifest, error) {

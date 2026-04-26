@@ -39,7 +39,7 @@ func TestHandleStandaloneWAVFilesConvertMP3AndRemoveWAV(t *testing.T) {
 		return nil
 	}
 
-	err := handleStandaloneWAVFiles(dir, protocol.ExportOptions{ConvertAudioToMP3: true, RemoveWav: true}, "ffmpeg-test")
+	err := handleStandaloneWAVFiles(dir, protocol.ExportOptions{ConvertAudioToMP3: true, RemoveWav: true}, "ffmpeg-test", nil)
 	if err != nil {
 		t.Fatalf("handleStandaloneWAVFiles failed: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestHandleStandaloneWAVFilesConvertFLAC(t *testing.T) {
 		return os.WriteFile(flacFile, []byte("flac"), 0o644)
 	}
 
-	err := handleStandaloneWAVFiles(dir, protocol.ExportOptions{ConvertWavToFLAC: true}, "ffmpeg-test")
+	err := handleStandaloneWAVFiles(dir, protocol.ExportOptions{ConvertWavToFLAC: true}, "ffmpeg-test", nil)
 	if err != nil {
 		t.Fatalf("handleStandaloneWAVFiles failed: %v", err)
 	}
@@ -108,12 +108,26 @@ func TestHandleStandaloneWAVFilesRemoveOnly(t *testing.T) {
 		return nil
 	}
 
-	err := handleStandaloneWAVFiles(dir, protocol.ExportOptions{RemoveWav: true}, "ffmpeg-test")
+	err := handleStandaloneWAVFiles(dir, protocol.ExportOptions{RemoveWav: true}, "ffmpeg-test", nil)
 	if err != nil {
 		t.Fatalf("handleStandaloneWAVFiles failed: %v", err)
 	}
 	if _, err := os.Stat(wavPath); !os.IsNotExist(err) {
 		t.Fatalf("expected wav to be removed, stat err=%v", err)
+	}
+}
+
+func TestValidateExpectedManifestOutputsRejectsResidualWAV(t *testing.T) {
+	err := validateExpectedManifestOutputs(protocol.TaskResultManifest{Files: []protocol.ResultFile{
+		{Path: "streaming_live/music/se_000_joint_lon_vbs_encore/sound.wav"},
+	}}, protocol.ExportOptions{
+		ExportACBFiles:    true,
+		DecodeACBFiles:    true,
+		ConvertAudioToMP3: true,
+		RemoveWav:         true,
+	})
+	if err == nil {
+		t.Fatalf("expected residual wav validation error")
 	}
 }
 
