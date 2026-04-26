@@ -133,19 +133,29 @@ func (w *Worker) register(ctx context.Context) error {
 }
 
 func (w *Worker) configureMemoryLimit() {
-	if _, ok := os.LookupEnv("GOMEMLIMIT"); ok {
+	if value, ok := os.LookupEnv("GOMEMLIMIT"); ok {
+		w.logger.Infof("GOMEMLIMIT is controlled by environment: %s", value)
 		return
 	}
-	_, limit, ok := cgroupMemory()
-	if !ok || limit == 0 {
+	if w.cfg.Diagnostics.GoMemoryLimitMB < 0 || w.cfg.Diagnostics.GoMemoryLimitPercent < 0 {
+		w.logger.Infof("auto GOMEMLIMIT disabled by diagnostics config")
 		return
 	}
-	memoryLimit := int64(limit * 60 / 100)
-	if memoryLimit <= 0 {
+
+	var memoryLimit uint64
+	source := ""
+	if w.cfg.Diagnostics.GoMemoryLimitMB > 0 {
+		memoryLimit = uint64(w.cfg.Diagnostics.GoMemoryLimitMB) * 1024 * 1024
+		source = "diagnostics.go_memory_limit_mb"
+	} else if _, limit, ok := cgroupMemory(); ok && limit > 0 && w.cfg.Diagnostics.GoMemoryLimitPercent > 0 {
+		memoryLimit = limit * uint64(w.cfg.Diagnostics.GoMemoryLimitPercent) / 100
+		source = fmt.Sprintf("%d%% of cgroup limit %s", w.cfg.Diagnostics.GoMemoryLimitPercent, formatBytes(limit))
+	}
+	if memoryLimit == 0 || memoryLimit > uint64(^uint(0)>>1) {
 		return
 	}
-	previous := debug.SetMemoryLimit(memoryLimit)
-	w.logger.Infof("auto GOMEMLIMIT set to %s from cgroup limit %s (previous=%s)", formatBytes(uint64(memoryLimit)), formatBytes(limit), formatLimit(uint64(previous)))
+	previous := debug.SetMemoryLimit(int64(memoryLimit))
+	w.logger.Infof("GOMEMLIMIT set to %s from %s (previous=%s)", formatBytes(memoryLimit), source, formatLimit(uint64(previous)))
 }
 
 func (w *Worker) warnOnHighConcurrency() {
@@ -157,8 +167,15 @@ func (w *Worker) warnOnHighConcurrency() {
 	if postProcess <= 0 {
 		postProcess = w.cfg.Worker.MaxTasks
 	}
+	w.logger.Infof("effective concurrency: max_tasks=%d download=%d asset_studio=%d postprocess=%d acb=%d usm=%d hca=%d hca_global=%t", w.cfg.Worker.MaxTasks, w.cfg.Concurrency.Download, assetStudio, postProcess, w.cfg.Concurrency.ACB, w.cfg.Concurrency.USM, w.cfg.Concurrency.HCA, w.cfg.Concurrency.HCAGlobal)
+	if assetStudio < w.cfg.Worker.MaxTasks || postProcess < w.cfg.Worker.MaxTasks {
+		w.logger.Warnf("asset_studio/postprocess below max_tasks may throttle throughput; set them to 0 or >= max_tasks for initial-version style performance")
+	}
+	if w.cfg.Concurrency.HCAGlobal {
+		w.logger.Warnf("hca_global=true limits HCA concurrency across the whole client; set hca_global=false for initial-version style per-ACB HCA parallelism")
+	}
 	if w.cfg.Worker.MaxTasks >= 64 || assetStudio >= 64 || postProcess >= 64 || w.cfg.Concurrency.ACB >= 64 || w.cfg.Concurrency.USM >= 64 || w.cfg.Concurrency.HCA >= 64 {
-		w.logger.Warnf("high concurrency enabled (max_tasks=%d download=%d asset_studio=%d postprocess=%d acb=%d usm=%d hca=%d); performance mode is allowed, but reduce these if cgroup memory approaches the limit", w.cfg.Worker.MaxTasks, w.cfg.Concurrency.Download, assetStudio, postProcess, w.cfg.Concurrency.ACB, w.cfg.Concurrency.USM, w.cfg.Concurrency.HCA)
+		w.logger.Warnf("high concurrency enabled; performance mode is allowed, but reduce these if cgroup memory approaches the limit")
 	}
 }
 
@@ -196,8 +213,12 @@ func (w *Worker) runtimeStatsLoop(ctx context.Context) {
 }
 
 func (w *Worker) releaseMemoryAfterTask(taskID string) {
+	threshold := w.cfg.Diagnostics.FreeOSMemoryThresholdPercent
+	if threshold <= 0 {
+		return
+	}
 	current, limit, ok := cgroupMemory()
-	if !ok || limit == 0 || current*100/limit < 60 {
+	if !ok || limit == 0 || current*100/limit < uint64(threshold) {
 		return
 	}
 	var before runtime.MemStats
@@ -216,13 +237,15 @@ func (w *Worker) logRuntimeStats() {
 	runtime.ReadMemStats(&mem)
 	goroutines := runtime.NumGoroutine()
 	active := w.activeTaskCount()
+	goLimit := debug.SetMemoryLimit(-1)
 	if current, limit, ok := cgroupMemory(); ok {
-		w.logger.Infof("runtime stats: goroutines=%d active_tasks=%d heap_alloc=%s heap_sys=%s stack_inuse=%s next_gc=%s gc=%d cgroup_memory=%s/%s", goroutines, active, formatBytes(mem.HeapAlloc), formatBytes(mem.HeapSys), formatBytes(mem.StackInuse), formatBytes(mem.NextGC), mem.NumGC, formatBytes(current), formatLimit(limit))
-		if limit > 0 && current*100/limit >= 85 {
-			w.logger.Warnf("cgroup memory usage is high: %s/%s", formatBytes(current), formatBytes(limit))
+		w.logger.Infof("runtime stats: goroutines=%d active_tasks=%d heap_alloc=%s heap_sys=%s stack_inuse=%s next_gc=%s gc=%d go_mem_limit=%s cgroup_memory=%s/%s", goroutines, active, formatBytes(mem.HeapAlloc), formatBytes(mem.HeapSys), formatBytes(mem.StackInuse), formatBytes(mem.NextGC), mem.NumGC, formatLimit(uint64(goLimit)), formatBytes(current), formatLimit(limit))
+		warnPercent := w.cfg.Diagnostics.WarnCgroupMemoryPercent
+		if warnPercent > 0 && limit > 0 && current*100/limit >= uint64(warnPercent) {
+			w.logger.Warnf("cgroup memory usage is high: %s/%s (%d%% threshold)", formatBytes(current), formatBytes(limit), warnPercent)
 		}
 	} else {
-		w.logger.Infof("runtime stats: goroutines=%d active_tasks=%d heap_alloc=%s heap_sys=%s stack_inuse=%s next_gc=%s gc=%d", goroutines, active, formatBytes(mem.HeapAlloc), formatBytes(mem.HeapSys), formatBytes(mem.StackInuse), formatBytes(mem.NextGC), mem.NumGC)
+		w.logger.Infof("runtime stats: goroutines=%d active_tasks=%d heap_alloc=%s heap_sys=%s stack_inuse=%s next_gc=%s gc=%d go_mem_limit=%s", goroutines, active, formatBytes(mem.HeapAlloc), formatBytes(mem.HeapSys), formatBytes(mem.StackInuse), formatBytes(mem.NextGC), mem.NumGC, formatLimit(uint64(goLimit)))
 	}
 	if w.cfg.Diagnostics.WarnGoroutines > 0 && goroutines >= w.cfg.Diagnostics.WarnGoroutines {
 		w.logger.Warnf("goroutine count %d reached warning threshold %d", goroutines, w.cfg.Diagnostics.WarnGoroutines)
@@ -268,7 +291,7 @@ func readUintFile(path string) (uint64, bool) {
 }
 
 func formatLimit(v uint64) string {
-	if v == 0 {
+	if v == 0 || v >= 1<<62 {
 		return "unlimited"
 	}
 	return formatBytes(v)

@@ -48,19 +48,24 @@ type ToolConfig struct {
 }
 
 type ConcurrencyConfig struct {
-	Download    int `yaml:"download"`
-	AssetStudio int `yaml:"asset_studio"`
-	PostProcess int `yaml:"postprocess"`
-	ACB         int `yaml:"acb"`
-	USM         int `yaml:"usm"`
-	HCA         int `yaml:"hca"`
+	Download    int  `yaml:"download"`
+	AssetStudio int  `yaml:"asset_studio"`
+	PostProcess int  `yaml:"postprocess"`
+	ACB         int  `yaml:"acb"`
+	USM         int  `yaml:"usm"`
+	HCA         int  `yaml:"hca"`
+	HCAGlobal   bool `yaml:"hca_global"`
 }
 
 type DiagnosticsConfig struct {
-	RuntimeStatsIntervalSeconds int    `yaml:"runtime_stats_interval_seconds"`
-	PprofAddress                string `yaml:"pprof_address"`
-	WarnHeapMB                  uint64 `yaml:"warn_heap_mb"`
-	WarnGoroutines              int    `yaml:"warn_goroutines"`
+	RuntimeStatsIntervalSeconds  int    `yaml:"runtime_stats_interval_seconds"`
+	PprofAddress                 string `yaml:"pprof_address"`
+	GoMemoryLimitMB              int64  `yaml:"go_memory_limit_mb"`
+	GoMemoryLimitPercent         int    `yaml:"go_memory_limit_percent"`
+	FreeOSMemoryThresholdPercent int    `yaml:"free_os_memory_threshold_percent"`
+	WarnCgroupMemoryPercent      int    `yaml:"warn_cgroup_memory_percent"`
+	WarnHeapMB                   uint64 `yaml:"warn_heap_mb"`
+	WarnGoroutines               int    `yaml:"warn_goroutines"`
 }
 
 type LoggingConfig struct {
@@ -155,6 +160,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Diagnostics.RuntimeStatsIntervalSeconds == 0 {
 		c.Diagnostics.RuntimeStatsIntervalSeconds = 60
+	}
+	if c.Diagnostics.GoMemoryLimitPercent == 0 {
+		c.Diagnostics.GoMemoryLimitPercent = 70
+	}
+	if c.Diagnostics.FreeOSMemoryThresholdPercent == 0 {
+		c.Diagnostics.FreeOSMemoryThresholdPercent = 70
+	}
+	if c.Diagnostics.WarnCgroupMemoryPercent == 0 {
+		c.Diagnostics.WarnCgroupMemoryPercent = 85
 	}
 	if c.Diagnostics.WarnHeapMB == 0 {
 		c.Diagnostics.WarnHeapMB = 4096

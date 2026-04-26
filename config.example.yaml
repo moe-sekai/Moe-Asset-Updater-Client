@@ -37,12 +37,22 @@ concurrency:
   acb: 16
   usm: 4
   hca: 16
+  # false = per-ACB HCA concurrency, matching the initial high-throughput behavior.
+  # true = global HCA limiter across the whole client, safer but slower.
+  hca_global: false
 
 diagnostics:
   # Logs heap/goroutine stats every N seconds. Set -1 to disable.
   runtime_stats_interval_seconds: 60
   # Set to e.g. "127.0.0.1:6060" to enable net/http/pprof.
   pprof_address: ""
+  # GOMEMLIMIT tuning: env GOMEMLIMIT wins. go_memory_limit_mb > 0 uses an explicit limit.
+  # Otherwise the client uses go_memory_limit_percent of the container/cgroup limit. Set either to -1 to disable.
+  go_memory_limit_mb: 0
+  go_memory_limit_percent: 70
+  # Run GC + FreeOSMemory after a task only when cgroup memory reaches this percentage. Set -1 to disable.
+  free_os_memory_threshold_percent: 70
+  warn_cgroup_memory_percent: 85
   warn_heap_mb: 4096
   warn_goroutines: 2000
 

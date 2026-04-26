@@ -38,6 +38,11 @@ type Unpacker struct {
 	hcaSem         chan struct{}
 }
 
+var (
+	convertWavToMP3  = exporter.ConvertWavToMP3
+	convertWavToFLAC = exporter.ConvertWavToFLAC
+)
+
 func New(cfg *config.Config, logger *harukiLogger.Logger) *Unpacker {
 	download := effectiveConcurrency(logger, "download", cfg.Concurrency.Download, 2, 0)
 	assetStudio := cfg.Concurrency.AssetStudio
@@ -328,6 +333,9 @@ func (u *Unpacker) postProcessExportedFiles(ctx context.Context, exportPath stri
 	if err := u.handleACBFiles(ctx, exportPath, options); err != nil {
 		return fmt.Errorf("failed to handle ACB files in %s: %w", exportPath, err)
 	}
+	if err := handleStandaloneWAVFiles(exportPath, options, u.cfg.Tools.FFMPEGPath); err != nil {
+		return fmt.Errorf("failed to handle WAV conversion in %s: %w", exportPath, err)
+	}
 	if err := handlePNGConversion(exportPath, options); err != nil {
 		return fmt.Errorf("failed to handle PNG conversion in %s: %w", exportPath, err)
 	}
@@ -399,7 +407,11 @@ func (u *Unpacker) handleACBFiles(ctx context.Context, exportPath string, option
 					}()
 					u.logger.Infof("Exporting ACB file: %s", a)
 					acbOutputDir := filepath.Dir(a)
-					if err := exporter.ExportACB(ctx, a, acbOutputDir, options.DecodeHCAFiles, options.RemoveWav, options.ConvertAudioToMP3, options.ConvertWavToFLAC, u.cfg.Tools.FFMPEGPath, cap(u.hcaSem), u.hcaSem); err != nil {
+					var hcaLimiter chan struct{}
+					if u.cfg.Concurrency.HCAGlobal {
+						hcaLimiter = u.hcaSem
+					}
+					if err := exporter.ExportACB(ctx, a, acbOutputDir, options.DecodeHCAFiles, options.RemoveWav, options.ConvertAudioToMP3, options.ConvertWavToFLAC, u.cfg.Tools.FFMPEGPath, u.cfg.Concurrency.HCA, hcaLimiter); err != nil {
 						errChan <- fmt.Errorf("failed to export ACB %s: %w", a, err)
 					}
 				}()
@@ -436,6 +448,81 @@ func (u *Unpacker) handleACBFiles(ctx context.Context, exportPath string, option
 	}
 	if errorCount > 0 {
 		return fmt.Errorf("failed to export %d ACB files: %w", errorCount, firstErr)
+	}
+	return nil
+}
+
+func handleStandaloneWAVFiles(exportPath string, options protocol.ExportOptions, ffmpegPath string) error {
+	if !options.ConvertAudioToMP3 && !options.ConvertWavToFLAC && !options.RemoveWav {
+		return nil
+	}
+	wavFiles, err := utils.FindFilesByExtension(exportPath, ".wav")
+	if err != nil {
+		return err
+	}
+	for _, wavFile := range wavFiles {
+		basePath := strings.TrimSuffix(wavFile, filepath.Ext(wavFile))
+		switch {
+		case options.ConvertAudioToMP3:
+			mp3File := basePath + ".mp3"
+			exists, err := outputFileExistsNonEmpty(mp3File)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				if err := convertWavToMP3(wavFile, mp3File, options.RemoveWav, ffmpegPath); err != nil {
+					return fmt.Errorf("failed to convert standalone WAV %s to MP3: %w", wavFile, err)
+				}
+				continue
+			}
+			if options.RemoveWav {
+				if err := removeFileIfExists(wavFile); err != nil {
+					return err
+				}
+			}
+		case options.ConvertWavToFLAC:
+			flacFile := basePath + ".flac"
+			exists, err := outputFileExistsNonEmpty(flacFile)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				if err := convertWavToFLAC(wavFile, flacFile, options.RemoveWav, ffmpegPath); err != nil {
+					return fmt.Errorf("failed to convert standalone WAV %s to FLAC: %w", wavFile, err)
+				}
+				continue
+			}
+			if options.RemoveWav {
+				if err := removeFileIfExists(wavFile); err != nil {
+					return err
+				}
+			}
+		case options.RemoveWav:
+			if err := removeFileIfExists(wavFile); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func outputFileExistsNonEmpty(path string) (bool, error) {
+	stat, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if stat.IsDir() {
+		return false, fmt.Errorf("output path %s is a directory", path)
+	}
+	return stat.Size() > 0, nil
+}
+
+func removeFileIfExists(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove WAV file %s: %w", path, err)
 	}
 	return nil
 }

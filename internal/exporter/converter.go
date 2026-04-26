@@ -138,12 +138,13 @@ func ConvertUSMToMP4(usmFile string, mp4File string, ffmpegPath string) error {
 }
 
 func ConvertWavToFLAC(wavFile string, flacFile string, deleteOriginal bool, ffmpegPath string) error {
+	stderr := &limitedBuffer{limit: 64 * 1024}
 	args := ffmpegBaseArgs("-i", wavFile, "-compression_level", "12", "-y", flacFile)
 	cmd := exec.Command(ffmpegPath, args...)
 	cmd.Stdout = nil
-	cmd.Stderr = nil
+	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to convert WAV to FLAC: %w", err)
+		return fmt.Errorf("failed to convert WAV to FLAC: %w\nffmpeg stderr: %s", err, stderr.String())
 	}
 	if err := validateOutputFile(flacFile, "flac"); err != nil {
 		return err
