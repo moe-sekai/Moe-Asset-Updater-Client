@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -111,6 +112,26 @@ func expandEnvPreservingTemplates(value string) string {
 	})
 }
 
+func normalizeHTTPBaseURL(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" || strings.Contains(value, "://") {
+		return value
+	}
+	return "http://" + value
+}
+
+func normalizeTCPAddress(raw string) string {
+	value := strings.TrimSpace(raw)
+	if value == "" || !strings.Contains(value, "://") {
+		return value
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" {
+		return value
+	}
+	return parsed.Host
+}
+
 func (c *Config) applyDefaults() {
 	if c.Client.Mode == "" {
 		c.Client.Mode = "http"
@@ -118,9 +139,11 @@ func (c *Config) applyDefaults() {
 	if c.Client.ServerURL == "" {
 		c.Client.ServerURL = "http://127.0.0.1:8080"
 	}
+	c.Client.ServerURL = normalizeHTTPBaseURL(c.Client.ServerURL)
 	if c.Client.TCPAddress == "" {
 		c.Client.TCPAddress = "127.0.0.1:9090"
 	}
+	c.Client.TCPAddress = normalizeTCPAddress(c.Client.TCPAddress)
 	if c.Client.TCPReconnectSeconds <= 0 {
 		c.Client.TCPReconnectSeconds = 5
 	}
