@@ -1,7 +1,13 @@
 client:
+  # Task connection mode: "http" keeps the existing lease polling; "tcp" uses the TCP long-lived task channel.
+  mode: "http"
   # Docker Compose: http://server:8080
   # Local debug:    http://127.0.0.1:8080
   server_url: "http://server:8080"
+  # Docker Compose TCP: server:9090
+  # Local debug TCP:    127.0.0.1:9090
+  tcp_address: "server:9090"
+  tcp_reconnect_seconds: 5
   bearer_token: "${MOE_ASSET_TOKEN}"
   user_agent: "MoeInternal/AssetClient"
   timeout_seconds: 21600

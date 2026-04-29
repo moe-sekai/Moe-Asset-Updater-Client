@@ -20,10 +20,13 @@ type Config struct {
 }
 
 type ClientConfig struct {
-	ServerURL      string `yaml:"server_url"`
-	BearerToken    string `yaml:"bearer_token"`
-	UserAgent      string `yaml:"user_agent"`
-	TimeoutSeconds int    `yaml:"timeout_seconds"`
+	Mode                string `yaml:"mode"`
+	ServerURL           string `yaml:"server_url"`
+	TCPAddress          string `yaml:"tcp_address"`
+	TCPReconnectSeconds int    `yaml:"tcp_reconnect_seconds"`
+	BearerToken         string `yaml:"bearer_token"`
+	UserAgent           string `yaml:"user_agent"`
+	TimeoutSeconds      int    `yaml:"timeout_seconds"`
 }
 
 type WorkerConfig struct {
@@ -109,8 +112,17 @@ func expandEnvPreservingTemplates(value string) string {
 }
 
 func (c *Config) applyDefaults() {
+	if c.Client.Mode == "" {
+		c.Client.Mode = "http"
+	}
 	if c.Client.ServerURL == "" {
 		c.Client.ServerURL = "http://127.0.0.1:8080"
+	}
+	if c.Client.TCPAddress == "" {
+		c.Client.TCPAddress = "127.0.0.1:9090"
+	}
+	if c.Client.TCPReconnectSeconds <= 0 {
+		c.Client.TCPReconnectSeconds = 5
 	}
 	if c.Client.UserAgent == "" {
 		c.Client.UserAgent = "MoeInternal/AssetClient"

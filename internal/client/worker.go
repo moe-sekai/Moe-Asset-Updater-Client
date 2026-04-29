@@ -34,6 +34,11 @@ type Worker struct {
 	active   map[string]struct{}
 }
 
+type taskTransport struct {
+	reportProgress func(context.Context, string, protocol.ProgressStage, float64, string) error
+	fail           func(context.Context, string, string) error
+}
+
 func NewWorker(cfg *config.Config, logger *harukiLogger.Logger) *Worker {
 	httpClient := resty.New().SetBaseURL(cfg.Client.ServerURL)
 	httpClient.SetHeader("User-Agent", cfg.Client.UserAgent)
@@ -50,6 +55,17 @@ func NewWorker(cfg *config.Config, logger *harukiLogger.Logger) *Worker {
 }
 
 func (w *Worker) Run(ctx context.Context) error {
+	switch strings.ToLower(strings.TrimSpace(w.cfg.Client.Mode)) {
+	case "", "http":
+		return w.runHTTP(ctx)
+	case "tcp":
+		return w.runTCP(ctx)
+	default:
+		return fmt.Errorf("unsupported client mode %q", w.cfg.Client.Mode)
+	}
+}
+
+func (w *Worker) runHTTP(ctx context.Context) error {
 	if err := os.MkdirAll(w.cfg.Workspace.Root, 0o755); err != nil {
 		return err
 	}
@@ -109,6 +125,13 @@ func (w *Worker) Run(ctx context.Context) error {
 				w.runTaskSafely(ctx, task)
 			}(task)
 		}
+	}
+}
+
+func (w *Worker) httpTaskTransport() taskTransport {
+	return taskTransport{
+		reportProgress: w.reportProgress,
+		fail:           w.fail,
 	}
 }
 
@@ -359,21 +382,31 @@ func (w *Worker) lease(ctx context.Context, maxTasks int) ([]protocol.TaskPayloa
 }
 
 func (w *Worker) runTaskSafely(parent context.Context, task protocol.TaskPayload) {
+	w.runTaskSafelyWithTransport(parent, task, w.httpTaskTransport())
+}
+
+func (w *Worker) runTaskSafelyWithTransport(parent context.Context, task protocol.TaskPayload, transport taskTransport) {
 	defer func() {
 		if r := recover(); r != nil {
 			stack := debug.Stack()
 			w.logger.Errorf("task %s panicked: %v\n%s", task.TaskID, r, stack)
 			failCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			if err := w.fail(failCtx, task.TaskID, fmt.Sprintf("panic: %v", r)); err != nil {
-				w.logger.Warnf("failed to report panic for %s: %v", task.TaskID, err)
+			if transport.fail != nil {
+				if err := transport.fail(failCtx, task.TaskID, fmt.Sprintf("panic: %v", r)); err != nil {
+					w.logger.Warnf("failed to report panic for %s: %v", task.TaskID, err)
+				}
 			}
 		}
 	}()
-	w.handleTask(parent, task)
+	w.handleTaskWithTransport(parent, task, transport)
 }
 
 func (w *Worker) handleTask(parent context.Context, task protocol.TaskPayload) {
+	w.handleTaskWithTransport(parent, task, w.httpTaskTransport())
+}
+
+func (w *Worker) handleTaskWithTransport(parent context.Context, task protocol.TaskPayload, transport taskTransport) {
 	w.addActive(task.TaskID)
 	defer w.removeActive(task.TaskID)
 	defer w.releaseMemoryAfterTask(task.TaskID)
@@ -383,7 +416,10 @@ func (w *Worker) handleTask(parent context.Context, task protocol.TaskPayload) {
 
 	w.logger.Infof("start task %s (%s)", task.TaskID, task.BundlePath)
 	report := func(stage protocol.ProgressStage, progress float64, message string) {
-		if err := w.reportProgress(ctx, task.TaskID, stage, progress, message); err != nil {
+		if transport.reportProgress == nil {
+			return
+		}
+		if err := transport.reportProgress(ctx, task.TaskID, stage, progress, message); err != nil {
 			w.logger.Warnf("failed to report progress for %s: %v", task.TaskID, err)
 		}
 	}
@@ -392,7 +428,9 @@ func (w *Worker) handleTask(parent context.Context, task protocol.TaskPayload) {
 	manifestPath := filepath.Join(taskDir, "manifest.json")
 	if err != nil {
 		w.logger.Errorf("task %s failed: %v", task.TaskID, err)
-		_ = w.fail(ctx, task.TaskID, err.Error())
+		if transport.fail != nil {
+			_ = transport.fail(ctx, task.TaskID, err.Error())
+		}
 		w.cleanupTaskDir(taskDir, true)
 		return
 	}
@@ -400,7 +438,9 @@ func (w *Worker) handleTask(parent context.Context, task protocol.TaskPayload) {
 	report(protocol.StageUploadResult, 0.92, "uploading result to server")
 	if err := w.uploadResult(ctx, task.TaskID, manifestPath, archivePath); err != nil {
 		w.logger.Errorf("task %s result upload failed: %v", task.TaskID, err)
-		_ = w.fail(ctx, task.TaskID, err.Error())
+		if transport.fail != nil {
+			_ = transport.fail(ctx, task.TaskID, err.Error())
+		}
 		w.cleanupTaskDir(taskDir, true)
 		return
 	}

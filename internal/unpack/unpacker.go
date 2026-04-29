@@ -300,10 +300,95 @@ func (u *Unpacker) ExtractUnityAssetBundle(ctx context.Context, filePath string,
 		return fmt.Errorf("failed to export asset bundle %s: %w", filePath, err)
 	}
 	u.logger.Infof("Successfully exported asset bundle: %s", filePath)
-	if err := u.postProcessExportedFiles(ctx, actualExportPath, options); err != nil {
-		return fmt.Errorf("post-processing failed for %s: %w", actualExportPath, err)
+	postProcessPath, pathMismatch, err := resolvePostProcessExportPath(actualExportPath, outputDir)
+	if err != nil {
+		return fmt.Errorf("failed to inspect exported files for %s: %w", actualExportPath, err)
+	}
+	if pathMismatch {
+		u.logger.Warnf("exported files were found outside expected path %s, falling back to output root %s (container path mismatch)", actualExportPath, outputDir)
+	}
+	if err := u.postProcessExportedFiles(ctx, postProcessPath, options); err != nil {
+		return fmt.Errorf("post-processing failed for %s: %w", postProcessPath, err)
 	}
 	return nil
+}
+
+func resolvePostProcessExportPath(expectedPath string, outputDir string) (string, bool, error) {
+	if expectedPath != "" {
+		if _, err := os.Stat(expectedPath); err == nil {
+			hasOutsideFiles, err := directoryHasFilesOutside(outputDir, expectedPath)
+			if err != nil {
+				return "", false, err
+			}
+			if hasOutsideFiles {
+				return outputDir, true, nil
+			}
+			return expectedPath, false, nil
+		} else if !os.IsNotExist(err) {
+			return "", false, err
+		}
+	}
+	hasFiles, err := directoryHasFiles(outputDir)
+	if err != nil {
+		return "", false, err
+	}
+	if hasFiles {
+		return outputDir, true, nil
+	}
+	return expectedPath, false, nil
+}
+
+func directoryHasFilesOutside(root string, expectedPath string) (bool, error) {
+	if root == "" || expectedPath == "" {
+		return false, nil
+	}
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	expectedPath = filepath.Clean(expectedPath)
+	hasOutsideFiles := false
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(expectedPath, path)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			hasOutsideFiles = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return hasOutsideFiles, err
+}
+
+func directoryHasFiles(root string) (bool, error) {
+	if root == "" {
+		return false, nil
+	}
+	if _, err := os.Stat(root); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	hasFiles := false
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() {
+			hasFiles = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return hasFiles, err
 }
 
 func getExportGroup(exportPath string) string {
