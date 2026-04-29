@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -677,7 +678,10 @@ func buildManifest(root string, task protocol.TaskPayload) (protocol.TaskResultM
 		if err != nil {
 			return err
 		}
-		rel = filepath.ToSlash(rel)
+		rel, err = sanitizeResultRelativePath(rel)
+		if err != nil {
+			return err
+		}
 		stat, err := d.Info()
 		if err != nil {
 			return err
@@ -690,6 +694,9 @@ func buildManifest(root string, task protocol.TaskPayload) (protocol.TaskResultM
 		return nil
 	})
 	if err != nil {
+		return protocol.TaskResultManifest{}, err
+	}
+	if err := rejectDuplicateResultPaths(manifest.Files); err != nil {
 		return protocol.TaskResultManifest{}, err
 	}
 	sort.Slice(manifest.Files, func(i, j int) bool { return manifest.Files[i].Path < manifest.Files[j].Path })
@@ -706,6 +713,7 @@ func createArchive(root string, archivePath string) error {
 	defer func() { _ = gz.Close() }()
 	tw := tar.NewWriter(gz)
 	defer func() { _ = tw.Close() }()
+	seen := make(map[string]string)
 	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -717,6 +725,14 @@ func createArchive(root string, archivePath string) error {
 		if err != nil {
 			return err
 		}
+		archiveName, err := sanitizeResultRelativePath(rel)
+		if err != nil {
+			return err
+		}
+		if previous, ok := seen[archiveName]; ok {
+			return fmt.Errorf("duplicate sanitized archive path %q from %q and %q", archiveName, previous, rel)
+		}
+		seen[archiveName] = rel
 		stat, err := d.Info()
 		if err != nil {
 			return err
@@ -725,7 +741,7 @@ func createArchive(root string, archivePath string) error {
 		if err != nil {
 			return err
 		}
-		header.Name = filepath.ToSlash(rel)
+		header.Name = archiveName
 		if err := tw.WriteHeader(header); err != nil {
 			return err
 		}
@@ -740,6 +756,47 @@ func createArchive(root string, archivePath string) error {
 		}
 		return closeErr
 	})
+}
+
+func rejectDuplicateResultPaths(files []protocol.ResultFile) error {
+	seen := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		if _, ok := seen[file.Path]; ok {
+			return fmt.Errorf("duplicate sanitized manifest path %q", file.Path)
+		}
+		seen[file.Path] = struct{}{}
+	}
+	return nil
+}
+
+func sanitizeResultRelativePath(rel string) (string, error) {
+	slashPath := filepath.ToSlash(rel)
+	cleaned := pathpkg.Clean(slashPath)
+	if cleaned == "." || strings.HasPrefix(cleaned, "../") || cleaned == ".." || strings.HasPrefix(cleaned, "/") {
+		return "", fmt.Errorf("unsafe result path %q", rel)
+	}
+
+	parts := strings.Split(cleaned, "/")
+	for i, part := range parts {
+		parts[i] = sanitizeResultPathPart(part)
+		if parts[i] == "" || parts[i] == "." || parts[i] == ".." {
+			return "", fmt.Errorf("unsafe result path component %q in %q", part, rel)
+		}
+	}
+	return strings.Join(parts, "/"), nil
+}
+
+func sanitizeResultPathPart(part string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == ':' || r == '\\':
+			return '_'
+		case r >= 0 && r < 0x20 || r == 0x7f:
+			return '_'
+		default:
+			return r
+		}
+	}, part)
 }
 
 func fileSHA256(path string) (string, error) {
