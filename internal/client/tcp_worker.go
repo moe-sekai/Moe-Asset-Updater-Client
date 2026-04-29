@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
 	"time"
 
 	"moe-asset-client/internal/protocol"
@@ -78,30 +77,29 @@ func (w *Worker) runTCPOnce(ctx context.Context) error {
 		return fmt.Errorf("unexpected tcp register response %q", registered.Type)
 	}
 	w.clientID = registered.ClientID
+	w.setTCPConn(conn)
+	defer w.clearTCPConn(conn)
 	w.logger.Infof("registered TCP task connection as client %s", w.clientID)
 	return w.runTCPConnection(ctx, conn)
 }
 
 func (w *Worker) runTCPConnection(parent context.Context, conn *tcpclient.Conn) error {
-	ctx, cancel := context.WithCancel(parent)
-	defer cancel()
+	connCtx, cancelConn := context.WithCancel(parent)
+	defer cancelConn()
 	go func() {
-		<-ctx.Done()
+		<-connCtx.Done()
 		_ = conn.Close()
 	}()
 
 	sem := make(chan struct{}, w.cfg.Worker.MaxTasks)
-	var wg sync.WaitGroup
-	defer wg.Wait()
-
 	heartbeatErr := make(chan error, 1)
-	go w.tcpHeartbeatLoop(ctx, conn, heartbeatErr)
-	transport := w.tcpTaskTransport(conn)
+	go w.tcpHeartbeatLoop(connCtx, conn, heartbeatErr)
+	transport := w.tcpTaskTransport()
 
 	for {
 		select {
 		case err := <-heartbeatErr:
-			cancel()
+			cancelConn()
 			_ = conn.Close()
 			return err
 		default:
@@ -109,22 +107,20 @@ func (w *Worker) runTCPConnection(parent context.Context, conn *tcpclient.Conn) 
 
 		msg, err := conn.Receive()
 		if err != nil {
-			cancel()
+			cancelConn()
 			return err
 		}
 		switch msg.Type {
 		case tcpclient.MessageTaskPush:
 			for _, task := range msg.Tasks {
 				select {
-				case <-ctx.Done():
-					return ctx.Err()
+				case <-parent.Done():
+					return parent.Err()
 				case sem <- struct{}{}:
 				}
-				wg.Add(1)
 				go func(task protocol.TaskPayload) {
-					defer wg.Done()
 					defer func() { <-sem }()
-					w.runTaskSafelyWithTransport(ctx, task, transport)
+					w.runTaskSafelyWithTransport(parent, task, transport)
 				}(task)
 			}
 		case tcpclient.MessageError:
@@ -165,20 +161,13 @@ func (w *Worker) tcpHeartbeatLoop(ctx context.Context, conn *tcpclient.Conn, err
 	}
 }
 
-func (w *Worker) tcpTaskTransport(conn *tcpclient.Conn) taskTransport {
-	send := func(msg tcpclient.Message) error {
-		err := conn.Send(msg)
-		if err != nil {
-			_ = conn.Close()
-		}
-		return err
-	}
+func (w *Worker) tcpTaskTransport() taskTransport {
 	return taskTransport{
 		reportProgress: func(ctx context.Context, taskID string, stage protocol.ProgressStage, progress float64, message string) error {
-			return send(tcpclient.Message{Type: tcpclient.MessageProgress, ClientID: w.clientID, TaskID: taskID, Stage: stage, Progress: progress, Message: message})
+			return w.sendTCPMessage(tcpclient.Message{Type: tcpclient.MessageProgress, ClientID: w.clientID, TaskID: taskID, Stage: stage, Progress: progress, Message: message})
 		},
 		fail: func(ctx context.Context, taskID string, message string) error {
-			return send(tcpclient.Message{Type: tcpclient.MessageFail, ClientID: w.clientID, TaskID: taskID, Error: message})
+			return w.sendTCPMessage(tcpclient.Message{Type: tcpclient.MessageFail, ClientID: w.clientID, TaskID: taskID, Error: message})
 		},
 	}
 }

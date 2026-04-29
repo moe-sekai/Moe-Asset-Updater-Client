@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,6 +19,7 @@ import (
 	"moe-asset-client/internal/config"
 	harukiLogger "moe-asset-client/internal/logger"
 	"moe-asset-client/internal/protocol"
+	"moe-asset-client/internal/tcpclient"
 	"moe-asset-client/internal/unpack"
 
 	"github.com/go-resty/resty/v2"
@@ -32,6 +34,14 @@ type Worker struct {
 	clientID string
 	activeMu sync.Mutex
 	active   map[string]struct{}
+
+	tcpMu   sync.RWMutex
+	tcpConn tcpMessageSender
+}
+
+type tcpMessageSender interface {
+	Send(msg tcpclient.Message) error
+	Close() error
 }
 
 type taskTransport struct {
@@ -59,10 +69,30 @@ func (w *Worker) Run(ctx context.Context) error {
 	case "", "http":
 		return w.runHTTP(ctx)
 	case "tcp":
+		if err := w.validateTCPModeConfig(); err != nil {
+			return err
+		}
 		return w.runTCP(ctx)
 	default:
 		return fmt.Errorf("unsupported client mode %q", w.cfg.Client.Mode)
 	}
+}
+
+func (w *Worker) validateTCPModeConfig() error {
+	httpHost := httpBaseHost(w.cfg.Client.ServerURL)
+	tcpHost := strings.TrimSpace(w.cfg.Client.TCPAddress)
+	if httpHost != "" && tcpHost != "" && strings.EqualFold(httpHost, tcpHost) {
+		return fmt.Errorf("tcp mode needs separate listeners: client.server_url=%q is the HTTP result API, client.tcp_address=%q is the raw TCP task channel; they currently point to the same host:port, so result uploads will be sent to the TCP port and get disconnected", w.cfg.Client.ServerURL, w.cfg.Client.TCPAddress)
+	}
+	return nil
+}
+
+func httpBaseHost(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err == nil && parsed.Host != "" {
+		return parsed.Host
+	}
+	return strings.TrimSpace(raw)
 }
 
 func (w *Worker) runHTTP(ctx context.Context) error {
@@ -133,6 +163,34 @@ func (w *Worker) httpTaskTransport() taskTransport {
 		reportProgress: w.reportProgress,
 		fail:           w.fail,
 	}
+}
+
+func (w *Worker) setTCPConn(conn tcpMessageSender) {
+	w.tcpMu.Lock()
+	defer w.tcpMu.Unlock()
+	w.tcpConn = conn
+}
+
+func (w *Worker) clearTCPConn(conn tcpMessageSender) {
+	w.tcpMu.Lock()
+	defer w.tcpMu.Unlock()
+	if w.tcpConn == conn {
+		w.tcpConn = nil
+	}
+}
+
+func (w *Worker) sendTCPMessage(msg tcpclient.Message) error {
+	w.tcpMu.RLock()
+	conn := w.tcpConn
+	w.tcpMu.RUnlock()
+	if conn == nil {
+		return fmt.Errorf("tcp task channel is not connected")
+	}
+	if err := conn.Send(msg); err != nil {
+		_ = conn.Close()
+		return err
+	}
+	return nil
 }
 
 func (w *Worker) register(ctx context.Context) error {
@@ -461,6 +519,31 @@ func (w *Worker) reportProgress(ctx context.Context, taskID string, stage protoc
 }
 
 func (w *Worker) uploadResult(ctx context.Context, taskID string, manifestPath string, archivePath string) error {
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(1<<(attempt-1)) * time.Second
+			w.logger.Warnf("result upload for %s attempt %d/%d failed: %v, retrying in %s", taskID, attempt, maxAttempts, lastErr, backoff)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+		if err := w.uploadResultOnce(ctx, taskID, manifestPath, archivePath); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func (w *Worker) uploadResultOnce(ctx context.Context, taskID string, manifestPath string, archivePath string) error {
 	r, err := w.http.R().
 		SetContext(ctx).
 		SetFile("manifest", manifestPath).
