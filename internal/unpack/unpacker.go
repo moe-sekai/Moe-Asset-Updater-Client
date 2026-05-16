@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	pathpkg "path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -262,11 +263,15 @@ func (u *Unpacker) ExtractUnityAssetBundle(ctx context.Context, filePath string,
 	} else {
 		actualExportPath = filepath.Join(outputDir, exportPath)
 	}
+	exportTypes, err := assetStudioExportTypes(exportPath, options)
+	if err != nil {
+		return fmt.Errorf("failed to resolve AssetStudio export types for %s: %w", exportPath, err)
+	}
 
 	args := []string{
 		filePath,
 		"-m", "export",
-		"-t", "monoBehaviour,textAsset,tex2d,tex2dArray,audio",
+		"-t", exportTypes,
 		"-g", getExportGroup(exportPath),
 		"-f", "assetName",
 		"-o", outputDir,
@@ -311,6 +316,36 @@ func (u *Unpacker) ExtractUnityAssetBundle(ctx context.Context, filePath string,
 		return fmt.Errorf("post-processing failed for %s: %w", postProcessPath, err)
 	}
 	return nil
+}
+
+func assetStudioExportTypes(exportPath string, options protocol.ExportOptions) (string, error) {
+	types := []string{"monoBehaviour", "textAsset", "tex2d", "tex2dArray", "audio"}
+	shouldExport, err := shouldExportMeshOBJ(exportPath, options)
+	if err != nil {
+		return "", err
+	}
+	if shouldExport {
+		types = append(types, "mesh")
+	}
+	return strings.Join(types, ","), nil
+}
+
+func shouldExportMeshOBJ(exportPath string, options protocol.ExportOptions) (bool, error) {
+	if !options.ExportMeshOBJ || len(options.MeshOBJPathPatterns) == 0 {
+		return false, nil
+	}
+	p := filepath.ToSlash(exportPath)
+	p = strings.TrimPrefix(p, "/")
+	for _, pattern := range options.MeshOBJPathPatterns {
+		matched, err := regexp.MatchString(pattern, p)
+		if err != nil {
+			return false, fmt.Errorf("invalid mesh obj path pattern %q: %w", pattern, err)
+		}
+		if matched {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func resolvePostProcessExportPath(expectedPath string, outputDir string) (string, bool, error) {

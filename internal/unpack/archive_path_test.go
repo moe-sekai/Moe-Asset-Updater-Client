@@ -3,7 +3,10 @@ package unpack
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"moe-asset-client/internal/protocol"
 )
 
 func TestSanitizeResultRelativePathReplacesServerUnsafeCharacters(t *testing.T) {
@@ -21,6 +24,95 @@ func TestSanitizeResultRelativePathRejectsTraversal(t *testing.T) {
 	if got, err := sanitizeResultRelativePath("../escape.json"); err == nil {
 		t.Fatalf("expected traversal path to be rejected, got %q", got)
 	}
+}
+
+func TestAssetStudioExportTypesAddsMeshForConfiguredPaths(t *testing.T) {
+	options := protocol.ExportOptions{
+		ExportMeshOBJ: true,
+		MeshOBJPathPatterns: []string{
+			`^mysekai/fixture(?:/|$)`,
+			`^mysekai/site/field/my_room_asset/skin(?:/|$)`,
+		},
+	}
+	tests := []string{
+		"mysekai/fixture/foo",
+		`mysekai\fixture\foo`,
+		"/mysekai/site/field/my_room_asset/skin/foo",
+		"mysekai/site/field/my_room_asset/skin",
+	}
+	for _, path := range tests {
+		got, err := assetStudioExportTypes(path, options)
+		if err != nil {
+			t.Fatalf("assetStudioExportTypes(%q) failed: %v", path, err)
+		}
+		if !exportTypesContain(got, "mesh") {
+			t.Fatalf("expected mesh export type for %q, got %q", path, got)
+		}
+	}
+}
+
+func TestAssetStudioExportTypesDoesNotOvermatchMeshPaths(t *testing.T) {
+	options := protocol.ExportOptions{
+		ExportMeshOBJ: true,
+		MeshOBJPathPatterns: []string{
+			`^mysekai/fixture(?:/|$)`,
+			`^mysekai/site/field/my_room_asset/skin(?:/|$)`,
+		},
+	}
+	tests := []string{
+		"mysekai/fixtures/foo",
+		"mysekai/site/field/my_room_asset/skinny/foo",
+		"mysekai/character/foo",
+	}
+	for _, path := range tests {
+		got, err := assetStudioExportTypes(path, options)
+		if err != nil {
+			t.Fatalf("assetStudioExportTypes(%q) failed: %v", path, err)
+		}
+		if exportTypesContain(got, "mesh") {
+			t.Fatalf("did not expect mesh export type for %q, got %q", path, got)
+		}
+	}
+}
+
+func TestAssetStudioExportTypesKeepsMeshDisabledWhenOptionIsFalse(t *testing.T) {
+	got, err := assetStudioExportTypes("mysekai/fixture/foo", protocol.ExportOptions{
+		ExportMeshOBJ:       false,
+		MeshOBJPathPatterns: []string{`^mysekai/fixture(?:/|$)`},
+	})
+	if err != nil {
+		t.Fatalf("assetStudioExportTypes failed: %v", err)
+	}
+	if exportTypesContain(got, "mesh") {
+		t.Fatalf("did not expect mesh export type when ExportMeshOBJ is false, got %q", got)
+	}
+	for _, want := range []string{"monoBehaviour", "textAsset", "tex2d", "tex2dArray", "audio"} {
+		if !exportTypesContain(got, want) {
+			t.Fatalf("expected default export type %q in %q", want, got)
+		}
+	}
+}
+
+func TestAssetStudioExportTypesReturnsInvalidMeshPatternError(t *testing.T) {
+	_, err := assetStudioExportTypes("mysekai/fixture/foo", protocol.ExportOptions{
+		ExportMeshOBJ:       true,
+		MeshOBJPathPatterns: []string{"["},
+	})
+	if err == nil {
+		t.Fatalf("expected invalid regex error")
+	}
+	if !strings.Contains(err.Error(), "invalid mesh obj path pattern") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func exportTypesContain(types string, want string) bool {
+	for _, t := range strings.Split(types, ",") {
+		if t == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestResolvePostProcessExportPathFallsBackToOutputRoot(t *testing.T) {
