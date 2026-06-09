@@ -279,7 +279,6 @@ func (u *Unpacker) ExtractUnityAssetBundle(ctx context.Context, filePath string,
 		"-r",
 		"--filter-exclude-mode",
 		"--filter-with-regex",
-		"--sekai-keep-single-container-filename",
 	}
 	if options.UnityVersion != "" {
 		args = append(args, "--unity-version", options.UnityVersion)
