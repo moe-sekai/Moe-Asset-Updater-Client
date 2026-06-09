@@ -16,7 +16,7 @@ FROM mcr.microsoft.com/dotnet/sdk:9.0-bookworm-slim AS assetstudio-builder
 WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && \
     rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 --single-branch --branch sekai-modify https://github.com/Team-Haruki/AssetStudio.git
+RUN git clone --depth 1 --single-branch --branch sekai-modified https://github.com/Team-Haruki/AssetStudio.git
 RUN cd AssetStudio/AssetStudioCLI && \
     dotnet publish -c Release -r linux-x64 -f net9.0 --self-contained true -o /app/assetstudio \
     -p:PublishTrimmed=false \
